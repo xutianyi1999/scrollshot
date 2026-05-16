@@ -14,17 +14,11 @@ use crate::error::{AppError, AppResult};
 const WHEEL_DELTA: i32 = 120;
 const FOCUS_SETTLE_MS: u64 = 80;
 
-pub struct ScrollController {
-    settle_ms: u64,
-    wheel_notches: i32,
-}
+pub struct ScrollController;
 
 impl ScrollController {
-    pub fn new(settle_ms: u64, wheel_notches: i32) -> Self {
-        Self {
-            settle_ms,
-            wheel_notches,
-        }
+    pub fn new() -> Self {
+        Self
     }
 
     pub fn focus_target(&self, point: POINT) -> AppResult<()> {
@@ -45,12 +39,12 @@ impl ScrollController {
         Ok(())
     }
 
-    pub fn scroll_down_once(&self, point: POINT) -> AppResult<()> {
+    pub fn scroll_down_once(&self, point: POINT, notches: i32) -> AppResult<()> {
         unsafe { SetCursorPos(point.x, point.y)? };
 
         let input = [mouse_input(
             MOUSE_EVENT_FLAGS(MOUSEEVENTF_WHEEL.0),
-            (-WHEEL_DELTA * self.wheel_notches) as u32,
+            (-WHEEL_DELTA * notches) as u32,
         )];
         let sent = unsafe { SendInput(&input, size_of::<INPUT>() as i32) };
         if sent != input.len() as u32 {
@@ -62,9 +56,6 @@ impl ScrollController {
         Ok(())
     }
 
-    pub fn settle_ms(&self) -> u64 {
-        self.settle_ms
-    }
 }
 
 fn mouse_input(flags: MOUSE_EVENT_FLAGS, mouse_data: u32) -> INPUT {
