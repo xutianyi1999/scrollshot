@@ -187,6 +187,21 @@ fn run() -> AppResult<()> {
                 continue;
             }
 
+            if let Some(overlap) = estimate_overlap_from_history(&overlaps, next.height()) {
+                eprintln!(
+                    "info: continuing with estimated overlap {} from history ({} prior frames)",
+                    overlap,
+                    overlaps.len()
+                );
+                retry_same_position = false;
+                same_position_recoveries = 0;
+                consecutive_misses_at_min = 0;
+                successful_steps = 0;
+                overlaps.push(overlap);
+                frames.push(next);
+                continue;
+            }
+
             if frames.len() == 1 {
                 return Err(AppError::OverlapNotFound);
             }
@@ -247,6 +262,19 @@ fn validate_frame_dimensions(previous: &image::RgbaImage, next: &image::RgbaImag
     }
 
     Ok(())
+}
+
+fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<u32> {
+    let recent: Vec<u32> = overlaps.iter().rev().take(10).copied().collect();
+    if recent.len() < 3 {
+        return None;
+    }
+    let mut sorted = recent;
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    let min_allowed = (frame_height as f32 * 0.01).max(4.0) as u32;
+    let max_allowed = frame_height.saturating_sub(2);
+    Some(median.clamp(min_allowed, max_allowed))
 }
 
 #[cfg(test)]
