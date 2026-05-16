@@ -11,7 +11,7 @@ const IDENTICAL_THRESHOLD: f32 = 1.5;
 const MIN_OVERLAP_RATIO: f32 = 0.02;
 const MAX_OVERLAP_RATIO: f32 = 0.995;
 const MIN_TEMPLATE_HEIGHT: u32 = 8;
-const TEMPLATE_HEIGHT_FACTORS: [u32; 5] = [1, 2, 3, 5, 8];
+const TEMPLATE_HEIGHT_FACTORS: [u32; 7] = [1, 2, 3, 5, 8, 13, 21];
 const MATCH_SCORE_THRESHOLD: f32 = 0.94;
 const LOCAL_CONFIDENCE_DELTA: f32 = 0.01;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.005;
@@ -143,6 +143,16 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage, relaxed: bool
     });
 
     let best = *primary_candidates.first()?;
+
+    if !sse_validate(
+        &previous_map,
+        &current_map,
+        best.template_height,
+        best.overlap,
+    ) {
+        return None;
+    }
+
     if best.score < score_threshold {
         return None;
     }
@@ -399,6 +409,7 @@ fn match_overlap_candidate(
     )
     .to_image();
     let search_region = crop_imm(&current, 0, 0, current.width(), max_overlap).to_image();
+
     let response = match_template(
         &search_region,
         &template,
@@ -421,6 +432,38 @@ fn match_overlap_candidate(
     })
 }
 
+fn sse_validate(
+    previous: &GrayImage,
+    current: &GrayImage,
+    template_height: u32,
+    ncc_overlap: u32,
+) -> bool {
+    let Some(template) = (template_height <= previous.height()).then(|| {
+        crop_imm(
+            previous,
+            0,
+            previous.height() - template_height,
+            previous.width(),
+            template_height,
+        )
+        .to_image()
+    }) else {
+        return true;
+    };
+    let ncc_pos_in_search = ncc_overlap.saturating_sub(template_height);
+    let search_region = crop_imm(current, 0, 0, current.width(), ncc_overlap).to_image();
+
+    let response = match_template(
+        &search_region,
+        &template,
+        MatchTemplateMethod::SumOfSquaredErrorsNormalized,
+    );
+    let sse_value = response.get_pixel(0, ncc_pos_in_search)[0].clamp(0.0, 1.0);
+    let sse_similarity = 1.0 - sse_value;
+
+    sse_similarity >= 0.70
+}
+
 fn refine_template_match(
     response: &imageproc::definitions::Image<image::Luma<f32>>,
     best_y: u32,
@@ -436,7 +479,7 @@ fn refine_template_match(
     let a = (s0 + s2 - 2.0 * s1) / 2.0;
     let b = (s2 - s0) / 2.0;
 
-    if a >= 0.0 {
+    if a >= -0.0001 {
         return (best_y as f32, s1);
     }
 
@@ -465,6 +508,24 @@ fn to_grayscale(image: &RgbaImage) -> GrayImage {
         gray.put_pixel(x, y, pixel.to_luma());
     }
     gray
+}
+
+fn mean_and_stddev(values: &[f32]) -> (f32, f32) {
+    if values.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = values.len() as f32;
+    let mean = values.iter().copied().sum::<f32>() / n;
+    let variance = values
+        .iter()
+        .copied()
+        .map(|v| {
+            let d = v - mean;
+            d * d
+        })
+        .sum::<f32>()
+        / n;
+    (mean, variance.sqrt())
 }
 
 fn estimate_texture_energy(image: &GrayImage) -> f32 {
@@ -502,13 +563,9 @@ fn to_feature_map(image: &RgbaImage, band: Option<HorizontalBand>) -> (GrayImage
         return (GrayImage::new(grayscale.width(), grayscale.height()), false);
     }
 
-    let n = pixels.len() as f32;
-    let mean = pixels.iter().copied().map(|v| v as f32).sum::<f32>() / n;
-    let variance = pixels.iter().copied().map(|v| {
-        let d = v as f32 - mean;
-        d * d
-    }).sum::<f32>() / n;
-    let normalizer = (mean + 3.0 * variance.sqrt()).max(1.0);
+    let pixel_f32: Vec<f32> = pixels.iter().copied().map(|v| v as f32).collect();
+    let (mean, stddev) = mean_and_stddev(&pixel_f32);
+    let normalizer = (mean + 3.0 * stddev).max(1.0);
 
     (
         GrayImage::from_fn(gradients.width(), gradients.height(), |x, y| {
@@ -594,16 +651,8 @@ fn detect_text_body_band(image: &GrayImage) -> Option<HorizontalBand> {
         return None;
     }
 
-    let mean_row_ink = row_ink.iter().copied().sum::<f32>() / row_ink.len() as f32;
-    let row_variation = row_ink
-        .iter()
-        .map(|value| {
-            let centered = *value - mean_row_ink;
-            centered * centered
-        })
-        .sum::<f32>()
-        / row_ink.len() as f32;
-    if row_variation.sqrt() < TEXT_PAGE_MIN_ROW_VARIATION {
+    let (_, row_stddev) = mean_and_stddev(&row_ink);
+    if row_stddev < TEXT_PAGE_MIN_ROW_VARIATION {
         return None;
     }
 
@@ -729,14 +778,23 @@ fn minimum_body_band_width(width: u32) -> u32 {
 }
 
 fn smooth_density(values: &[f32], radius: usize) -> Vec<f32> {
-    let mut smoothed = vec![0f32; values.len()];
-    for (index, out) in smoothed.iter_mut().enumerate() {
-        let start = index.saturating_sub(radius);
-        let end = (index + radius + 1).min(values.len());
-        let window = &values[start..end];
-        *out = window.iter().copied().sum::<f32>() / window.len() as f32;
+    let n = values.len();
+    if n == 0 {
+        return Vec::new();
     }
-    smoothed
+    let mut out = vec![0f32; n];
+    let mut running = 0f32;
+    for i in 0..n {
+        if i + radius < n {
+            running += values[i + radius];
+        }
+        let effective_len = (n.min(i + radius + 1) - i.saturating_sub(radius)) as f32;
+        out[i] = running / effective_len;
+        if i >= radius {
+            running -= values[i - radius];
+        }
+    }
+    out
 }
 
 fn score_body_band(
