@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{Error as WindowsError, w};
 
 use crate::error::{AppError, AppResult};
-use crate::window::ScreenRect;
+use crate::screen_rect::ScreenRect;
 
 const OVERLAY_CLASS: windows::core::PCWSTR = w!("ScrollshotSelectionOverlay");
 const OVERLAY_ALPHA: u8 = 48;

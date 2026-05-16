@@ -59,8 +59,11 @@ impl ScrollController {
             ));
         }
 
-        thread::sleep(Duration::from_millis(self.settle_ms));
         Ok(())
+    }
+
+    pub fn settle_ms(&self) -> u64 {
+        self.settle_ms
     }
 }
 

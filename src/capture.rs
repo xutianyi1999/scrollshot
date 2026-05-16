@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use crate::error::{AppError, AppResult};
-use crate::window::ScreenRect;
+use crate::screen_rect::ScreenRect;
 
 pub trait CaptureBackend {
     fn capture(&self) -> AppResult<RgbaImage>;

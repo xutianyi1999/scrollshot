@@ -17,12 +17,6 @@ pub enum AppError {
     #[error("{0}")]
     Message(String),
 
-    #[error("No foreground window is available")]
-    NoForegroundWindow,
-
-    #[error("No visible window matched title filter: {0}")]
-    WindowNotFound(String),
-
     #[error("Captured frame is empty")]
     EmptyCapture,
 
