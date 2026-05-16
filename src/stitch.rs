@@ -1,4 +1,4 @@
-use image::imageops::{crop_imm, replace};
+use image::imageops::{self, crop_imm, replace};
 use image::{GrayImage, Luma, Pixel, RgbaImage};
 use imageproc::contrast::otsu_level;
 use imageproc::gradients::sobel_gradients;
@@ -124,6 +124,18 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage, relaxed: bool
             )
         })
         .collect::<Vec<_>>();
+
+    if !relaxed {
+        if let Some(ms) = match_overlap_candidate_multiscale(
+            &previous_map,
+            &current_map,
+            min_overlap,
+            max_overlap,
+        ) {
+            primary_candidates.push(ms);
+        }
+    }
+
     primary_candidates.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
@@ -218,6 +230,57 @@ fn candidate_template_heights(min_overlap: u32, max_overlap: u32) -> Vec<u32> {
     heights.sort_unstable();
     heights.dedup();
     heights
+}
+
+fn match_overlap_candidate_multiscale(
+    previous: &GrayImage,
+    current: &GrayImage,
+    min_overlap: u32,
+    max_overlap: u32,
+) -> Option<MatchCandidate> {
+    let w = previous.width() / 2;
+    let h = previous.height() / 2;
+    if w < 20 || h < 20 {
+        return None;
+    }
+
+    let prev_small = imageops::resize(previous, w, h, imageops::FilterType::Triangle);
+    let curr_small = imageops::resize(current, w, h, imageops::FilterType::Triangle);
+
+    let min_small = (min_overlap / 2).max(MIN_TEMPLATE_HEIGHT);
+    let max_small = (max_overlap / 2 + 1).min(h.saturating_sub(1));
+    if min_small > max_small {
+        return None;
+    }
+
+    let heights = candidate_template_heights(min_small, max_small);
+    let best_small = heights
+        .iter()
+        .copied()
+        .filter_map(|th| {
+            match_overlap_candidate(&prev_small, &curr_small, th, min_small, max_small, None)
+        })
+        .max_by(|a, b| a.score.total_cmp(&b.score))?;
+
+    if best_small.score < 0.80 {
+        return None;
+    }
+
+    let estimate = best_small.overlap.saturating_mul(2);
+    let refine_min = estimate.saturating_sub(2).max(min_overlap);
+    let refine_max = (estimate + 2).min(max_overlap);
+    if refine_min > refine_max {
+        return None;
+    }
+
+    let refine_heights = candidate_template_heights(refine_min, refine_max);
+    refine_heights
+        .iter()
+        .copied()
+        .filter_map(|th| {
+            match_overlap_candidate(previous, current, th, refine_min, refine_max, None)
+        })
+        .max_by(|a, b| a.score.total_cmp(&b.score))
 }
 
 fn candidate_vote_bands(width: u32) -> Vec<HorizontalBand> {
