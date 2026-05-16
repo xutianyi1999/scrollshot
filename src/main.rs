@@ -16,7 +16,9 @@ use crate::cli::Cli;
 use crate::error::{AppError, AppResult};
 use crate::region::select_capture_region;
 use crate::scroll::ScrollController;
-use crate::stitch::{detect_vertical_overlap, frames_are_similar, stitch_vertical};
+use crate::stitch::{
+    detect_overlap_relaxed, detect_vertical_overlap, frames_are_similar, stitch_vertical,
+};
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 use windows::Win32::UI::HiDpi::{
@@ -28,7 +30,7 @@ const NOTCH_REDUCTION_ON_MISS: i32 = 1;
 const SETTLE_INCREMENT_MS: u64 = 50;
 const MAX_SETTLE_MS: u64 = 1000;
 const SUCCESSFUL_STEPS_BEFORE_RESTORE: usize = 3;
-const MAX_CONSECUTIVE_MISSES_AT_MIN_NOTCH: usize = 5;
+const MAX_CONSECUTIVE_MISSES_AT_MIN_NOTCH: usize = 3;
 const ESC_POLL_INTERVAL_MS: u64 = 25;
 const OVERLAP_MISS_RETRY_MS: u64 = 80;
 const MAX_SAME_POSITION_RECOVERIES: usize = 2;
@@ -168,6 +170,20 @@ fn run() -> AppResult<()> {
                     "info: increased settle to {} ms for better overlap",
                     current_settle_ms
                 );
+                continue;
+            }
+
+            if let Some(overlap) = detect_overlap_relaxed(previous, &next) {
+                eprintln!(
+                    "info: recovered with relaxed matching at overlap {}",
+                    overlap
+                );
+                retry_same_position = false;
+                same_position_recoveries = 0;
+                consecutive_misses_at_min = 0;
+                successful_steps = 0;
+                overlaps.push(overlap);
+                frames.push(next);
                 continue;
             }
 

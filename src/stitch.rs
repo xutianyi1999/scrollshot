@@ -1,5 +1,5 @@
 use image::imageops::{crop_imm, replace};
-use image::{GrayImage, Luma, RgbaImage};
+use image::{GrayImage, Luma, Pixel, RgbaImage};
 use imageproc::contrast::otsu_level;
 use imageproc::gradients::sobel_gradients;
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template};
@@ -16,7 +16,7 @@ const MATCH_SCORE_THRESHOLD: f32 = 0.94;
 const LOCAL_CONFIDENCE_DELTA: f32 = 0.01;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.005;
 const ALTERNATIVE_GAP: u32 = 4;
-const OVERLAP_VOTE_TOLERANCE: u32 = 1;
+const OVERLAP_VOTE_TOLERANCE: u32 = 5;
 const MIN_VOTE_WINDOW_WIDTH: u32 = 48;
 const VOTE_WINDOW_RATIO: f32 = 0.6;
 const TEXT_PAGE_MIN_BRIGHT_RATIO: f32 = 0.7;
@@ -73,6 +73,14 @@ pub fn frames_are_similar(previous: &RgbaImage, current: &RgbaImage) -> bool {
 }
 
 pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
+    detect_overlap_inner(previous, current, false)
+}
+
+pub fn detect_overlap_relaxed(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
+    detect_overlap_inner(previous, current, true)
+}
+
+fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage, relaxed: bool) -> Option<u32> {
     if previous.width() != current.width() || previous.height() != current.height() {
         return None;
     }
@@ -89,6 +97,18 @@ pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Opt
 
     let focus_band = shared_text_body_band(previous, current);
     let (previous_map, current_map) = overlap_match_maps(previous, current, focus_band);
+
+    let texture_energy = estimate_texture_energy(&previous_map);
+    let (score_threshold, local_delta, global_delta) = if relaxed {
+        let score = 0.82 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.82);
+        (score, LOCAL_CONFIDENCE_DELTA, GLOBAL_CONFIDENCE_DELTA)
+    } else {
+        let score = 0.86 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.86);
+        let local = 0.003 + texture_energy * (LOCAL_CONFIDENCE_DELTA - 0.003);
+        let global = 0.001 + texture_energy * (GLOBAL_CONFIDENCE_DELTA - 0.001);
+        (score, local, global)
+    };
+
     let template_heights = candidate_template_heights(min_overlap, max_overlap);
     let mut primary_candidates = template_heights
         .iter()
@@ -111,12 +131,12 @@ pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Opt
     });
 
     let best = *primary_candidates.first()?;
-    if best.score < MATCH_SCORE_THRESHOLD {
+    if best.score < score_threshold {
         return None;
     }
 
     let local_margin_ok = best.alternative_score.is_nan()
-        || (best.score - best.alternative_score) >= LOCAL_CONFIDENCE_DELTA;
+        || (best.score - best.alternative_score) >= local_delta;
     if !local_margin_ok {
         return None;
     }
@@ -126,7 +146,7 @@ pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Opt
         .skip(1)
         .find(|candidate| candidate.overlap.abs_diff(best.overlap) >= ALTERNATIVE_GAP);
     if let Some(other) = global_alternative {
-        let global_margin_ok = (best.score - other.score) >= GLOBAL_CONFIDENCE_DELTA;
+        let global_margin_ok = (best.score - other.score) >= global_delta;
         if !global_margin_ok {
             return None;
         }
@@ -323,17 +343,45 @@ fn match_overlap_candidate(
     );
     let extremes = find_extremes(&response);
     let best_y = extremes.max_value_location.1;
-    let usable_overlap = best_y + template_height;
-    if !(min_overlap..=max_overlap).contains(&usable_overlap) {
+
+    let (refined_y, refined_score) = refine_template_match(&response, best_y);
+    let refined_overlap = refined_y.round() as u32 + template_height;
+    if !(min_overlap..=max_overlap).contains(&refined_overlap) {
         return None;
     }
 
     Some(MatchCandidate {
-        overlap: usable_overlap,
-        score: extremes.max_value,
+        overlap: refined_overlap,
+        score: refined_score,
         alternative_score: best_alternative_score(&response, best_y),
         template_height,
     })
+}
+
+fn refine_template_match(
+    response: &imageproc::definitions::Image<image::Luma<f32>>,
+    best_y: u32,
+) -> (f32, f32) {
+    if best_y == 0 || best_y + 1 >= response.height() {
+        return (best_y as f32, response.get_pixel(0, best_y)[0]);
+    }
+
+    let s0 = response.get_pixel(0, best_y - 1)[0];
+    let s1 = response.get_pixel(0, best_y)[0];
+    let s2 = response.get_pixel(0, best_y + 1)[0];
+
+    let a = (s0 + s2 - 2.0 * s1) / 2.0;
+    let b = (s2 - s0) / 2.0;
+
+    if a >= 0.0 {
+        return (best_y as f32, s1);
+    }
+
+    let peak_shift = (-b / (2.0 * a)).clamp(-1.0, 1.0);
+    let peak_y = best_y as f32 + peak_shift;
+    let peak_score = a * peak_shift * peak_shift + b * peak_shift + s1;
+
+    (peak_y, peak_score)
 }
 
 fn best_alternative_score(
@@ -349,12 +397,20 @@ fn best_alternative_score(
 }
 
 fn to_grayscale(image: &RgbaImage) -> GrayImage {
-    GrayImage::from_fn(image.width(), image.height(), |x, y| {
-        let pixel = image.get_pixel(x, y).0;
-        let value =
-            (pixel[0] as f32 * 0.2126) + (pixel[1] as f32 * 0.7152) + (pixel[2] as f32 * 0.0722);
-        image::Luma([value.round().clamp(0.0, 255.0) as u8])
-    })
+    let mut gray = GrayImage::new(image.width(), image.height());
+    for (x, y, pixel) in image.enumerate_pixels() {
+        gray.put_pixel(x, y, pixel.to_luma());
+    }
+    gray
+}
+
+fn estimate_texture_energy(image: &GrayImage) -> f32 {
+    let total = image.width() as u64 * image.height() as u64;
+    if total == 0 {
+        return 0.0;
+    }
+    let sum: u64 = image.pixels().map(|p| p[0] as u64).sum();
+    (sum as f64 / total as f64 / 255.0) as f32
 }
 
 fn overlap_match_maps(
@@ -376,16 +432,25 @@ fn to_feature_map(image: &RgbaImage, band: Option<HorizontalBand>) -> (GrayImage
     let grayscale = to_grayscale(image);
     let grayscale = crop_gray_to_band(&grayscale, band);
     let gradients = sobel_gradients(&grayscale);
-    let max_gradient = gradients.pixels().map(|pixel| pixel[0]).max().unwrap_or(0);
+    let pixels: Vec<u16> = gradients.pixels().map(|p| p[0]).collect();
+    let max_gradient = pixels.iter().max().copied().unwrap_or(0);
 
     if max_gradient == 0 {
         return (GrayImage::new(grayscale.width(), grayscale.height()), false);
     }
 
+    let n = pixels.len() as f32;
+    let mean = pixels.iter().copied().map(|v| v as f32).sum::<f32>() / n;
+    let variance = pixels.iter().copied().map(|v| {
+        let d = v as f32 - mean;
+        d * d
+    }).sum::<f32>() / n;
+    let normalizer = (mean + 3.0 * variance.sqrt()).max(1.0);
+
     (
         GrayImage::from_fn(gradients.width(), gradients.height(), |x, y| {
             let gradient = gradients.get_pixel(x, y)[0] as f32;
-            let scaled = (gradient / max_gradient as f32) * 255.0;
+            let scaled = (gradient / normalizer) * 255.0;
             Luma([scaled.round().clamp(0.0, 255.0) as u8])
         }),
         true,
@@ -637,7 +702,7 @@ fn pixel_difference(a: [u8; 4], b: [u8; 4]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_vertical_overlap, frames_are_similar, shared_text_body_band, stitch_vertical};
+    use super::{detect_overlap_relaxed, detect_vertical_overlap, frames_are_similar, shared_text_body_band, stitch_vertical};
     use image::imageops::crop_imm;
     use image::{Rgba, RgbaImage};
 
@@ -829,4 +894,137 @@ mod tests {
         image
     }
 
+    fn build_striped_source(width: u32, height: u32) -> RgbaImage {
+        let mut image = RgbaImage::from_pixel(width, height, Rgba([240, 240, 240, 255]));
+        for y in (0..height).step_by(8) {
+            for x in 0..width {
+                let shade = if (y / 8) % 2 == 0 { 60 } else { 140 };
+                let varied = shade + ((x * 5 + y * 3) % 20) as u8;
+                image.put_pixel(x, y, Rgba([varied, varied, varied, 255]));
+            }
+        }
+        image
+    }
+
+    // ── Edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn overlap_detection_rejects_different_widths() {
+        let a = RgbaImage::from_pixel(48, 100, Rgba([128, 128, 128, 255]));
+        let b = RgbaImage::from_pixel(64, 100, Rgba([128, 128, 128, 255]));
+        assert_eq!(detect_vertical_overlap(&a, &b), None);
+    }
+
+    #[test]
+    fn overlap_detection_rejects_no_overlap() {
+        let source = build_source(48, 200);
+        let first = crop(&source, 0, 100);
+        let second = crop(&source, 120, 100);
+        assert_eq!(detect_vertical_overlap(&first, &second), None);
+    }
+
+    #[test]
+    fn overlap_detection_handles_maximal_overlap() {
+        let source = build_source(48, 200);
+        let first = crop(&source, 0, 160);
+        let second = crop(&source, 1, 160);
+        let result = detect_vertical_overlap(&first, &second);
+        assert!(result.is_some());
+        assert!(result.unwrap() > 150);
+    }
+
+    // ── Content types ───────────────────────────────────────
+
+    #[test]
+    fn overlap_detection_handles_varied_scroll_offset() {
+        let source = build_source(48, 200);
+        let first = crop(&source, 0, 100);
+        let second = crop(&source, 10, 100);
+        assert_eq!(detect_vertical_overlap(&first, &second), Some(90));
+    }
+
+    #[test]
+    fn detect_overlap_relaxed_matches_normal_for_clean_content() {
+        let source = build_source(48, 140);
+        let first = crop(&source, 0, 60);
+        let second = crop(&source, 23, 60);
+        assert_eq!(
+            detect_vertical_overlap(&first, &second),
+            detect_overlap_relaxed(&first, &second),
+        );
+    }
+
+    #[test]
+    fn overlap_detection_handles_striped_content() {
+        let source = build_striped_source(48, 160);
+        let first = crop(&source, 0, 80);
+        let second = crop(&source, 12, 80);
+        assert_eq!(detect_vertical_overlap(&first, &second), Some(68));
+    }
+
+    #[test]
+    fn overlap_detection_rejects_uniform_different_colors() {
+        let a = RgbaImage::from_pixel(48, 100, Rgba([200, 200, 200, 255]));
+        let b = RgbaImage::from_pixel(48, 100, Rgba([100, 100, 100, 255]));
+        assert_eq!(detect_vertical_overlap(&a, &b), None);
+    }
+
+    // ── frames_are_similar ──────────────────────────────────
+
+    #[test]
+    fn frames_are_similar_detects_identical() {
+        let source = build_source(32, 80);
+        let frame = crop(&source, 0, 40);
+        assert!(frames_are_similar(&frame, &frame));
+    }
+
+    #[test]
+    fn frames_are_similar_detects_different() {
+        let a = RgbaImage::from_pixel(32, 40, Rgba([200, 200, 200, 255]));
+        let b = RgbaImage::from_pixel(32, 40, Rgba([100, 100, 100, 255]));
+        assert!(!frames_are_similar(&a, &b));
+    }
+
+    #[test]
+    fn frames_are_similar_detects_different_sizes() {
+        let a = RgbaImage::from_pixel(32, 40, Rgba([128, 128, 128, 255]));
+        let b = RgbaImage::from_pixel(48, 40, Rgba([128, 128, 128, 255]));
+        assert!(!frames_are_similar(&a, &b));
+    }
+
+    // ── Stitching edge cases ────────────────────────────────
+
+    #[test]
+    fn stitching_handles_single_frame() {
+        let frame = build_source(40, 50);
+        let stitched = stitch_vertical(&[frame.clone()], &[]).unwrap();
+        assert_eq!(stitched, frame);
+    }
+
+    #[test]
+    fn stitching_rejects_frame_width_mismatch() {
+        let a = RgbaImage::from_pixel(40, 50, Rgba([128, 128, 128, 255]));
+        let b = RgbaImage::from_pixel(48, 50, Rgba([128, 128, 128, 255]));
+        assert!(stitch_vertical(&[a, b], &[10]).is_err());
+    }
+
+    #[test]
+    fn stitching_rejects_invalid_overlap_count() {
+        let a = RgbaImage::from_pixel(40, 50, Rgba([128, 128, 128, 255]));
+        let b = RgbaImage::from_pixel(40, 50, Rgba([128, 128, 128, 255]));
+        assert!(stitch_vertical(&[a, b], &[]).is_err());
+    }
+
+    #[test]
+    fn stitching_rejects_empty_frames() {
+        assert!(stitch_vertical(&[], &[]).is_err());
+    }
+
+    // ── Text body band ──────────────────────────────────────
+
+    #[test]
+    fn shared_text_body_band_returns_none_for_uniform() {
+        let uniform = RgbaImage::from_pixel(64, 64, Rgba([255, 255, 255, 255]));
+        assert!(shared_text_body_band(&uniform, &uniform).is_none());
+    }
 }
