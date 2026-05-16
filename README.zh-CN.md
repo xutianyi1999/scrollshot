@@ -12,16 +12,10 @@ Scrollshot 是一款命令行工具，可以在 Windows 上截取滚动长截图
 2. **自动滚动 & 截取** —— Scrollshot 在选中点发送模拟鼠标滚轮事件，通过 `xcap`（或 GDI 回退）逐帧截屏，利用计算机视觉（基于梯度的模板匹配 + 文本主体区域检测）计算相邻帧的重叠区域。
 3. **拼接** —— 去除重叠部分，将所有帧合成为一张连续图像。
 
-## 安装
+## 构建
 
 ```bash
-cargo install scrollshot
-```
-
-或从源码构建：
-
-```bash
-git clone https://github.com/your-username/scrollshot
+git clone https://github.com/xutianyi1999/scrollshot
 cd scrollshot
 cargo build --release
 ```
