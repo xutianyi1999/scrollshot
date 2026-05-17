@@ -77,9 +77,9 @@ fn run() -> AppResult<()> {
         }
 
         if let Some(overlap) = detect_vertical_overlap(previous, &next) {
-            let overlap = smooth_overlap(overlap, &measured_overlaps);
+            let smoothed = smooth_overlap(overlap, &measured_overlaps);
             overlaps.push(overlap);
-            measured_overlaps.push(overlap);
+            measured_overlaps.push(smoothed);
             frames.push(next);
         } else if let Some(overlap) = estimate_overlap_from_history(&measured_overlaps, next.height()) {
             eprintln!(

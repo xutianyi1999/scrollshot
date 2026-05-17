@@ -10,15 +10,14 @@ use rayon::prelude::*;
 
 use crate::error::{AppError, AppResult};
 
-const SAMPLE_STEP: u32 = 4;
-pub(crate) const IDENTICAL_THRESHOLD: f32 = 1.0;
+const SAMPLE_STEP: u32 = 2;
 const MIN_OVERLAP_RATIO: f32 = 0.02;
 const MAX_OVERLAP_RATIO: f32 = 0.995;
-const MIN_TEMPLATE_HEIGHT: u32 = 8;
-const TEMPLATE_HEIGHT_FACTORS: [u32; 7] = [1, 2, 3, 5, 8, 13, 21];
-const MATCH_SCORE_THRESHOLD: f32 = 0.92;
-const LOCAL_CONFIDENCE_DELTA: f32 = 0.01;
-const GLOBAL_CONFIDENCE_DELTA: f32 = 0.005;
+const MIN_TEMPLATE_HEIGHT: u32 = 12;
+const TEMPLATE_HEIGHT_FACTORS: [u32; 9] = [1, 2, 3, 5, 8, 13, 21, 34, 55];
+const MATCH_SCORE_THRESHOLD: f32 = 0.72;
+const LOCAL_CONFIDENCE_DELTA: f32 = 0.006;
+const GLOBAL_CONFIDENCE_DELTA: f32 = 0.003;
 const ALTERNATIVE_GAP: u32 = 4;
 const OVERLAP_VOTE_TOLERANCE: u32 = 5;
 const MIN_VOTE_WINDOW_WIDTH: u32 = 48;
@@ -33,7 +32,7 @@ const TEXT_BODY_MIN_WIDTH_RATIO: f32 = 0.18;
 const TEXT_BODY_PADDING_RATIO: f32 = 0.03;
 const SCROLLBAR_MARGIN_RATIO: f32 = 0.012;
 const SCROLLBAR_MARGIN_MAX: u32 = 24;
-const SSE_VALIDATE_THRESHOLD: f32 = 0.78;
+const SSE_VALIDATE_THRESHOLD: f32 = 0.70;
 
 #[derive(Clone, Copy, Debug)]
 struct MatchCandidate {
@@ -63,14 +62,6 @@ impl HorizontalBand {
     }
 }
 
-pub fn frames_are_similar(previous: &RgbaImage, current: &RgbaImage) -> bool {
-    if previous.dimensions() != current.dimensions() {
-        return false;
-    }
-    sampled_difference(
-        previous, current, 0, 0, previous.height(), SAMPLE_STEP * 2, None,
-    ) <= IDENTICAL_THRESHOLD
-}
 
 /// Check whether two consecutive frames are nearly identical (relaxed
 /// threshold) — used as a safety net for noisy stuck-at-bottom detection.
@@ -80,7 +71,7 @@ pub fn frames_near_stagnant(prev: &RgbaImage, curr: &RgbaImage) -> bool {
     }
     sampled_difference(
         prev, curr, 0, 0, prev.height(), SAMPLE_STEP, None,
-    ) <= 8.0
+    ) <= 3.0
 }
 
 pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
@@ -134,7 +125,7 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
             (previous_gray.clone(), current_gray.clone(), 0.0)
         };
     let (score_threshold, local_delta, global_delta) = {
-        let score = 0.86 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.86);
+        let score = 0.68 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.68);
         let local = 0.003 + texture_energy * (LOCAL_CONFIDENCE_DELTA - 0.003);
         let global = 0.001 + texture_energy * (GLOBAL_CONFIDENCE_DELTA - 0.001);
         (score, local, global)
@@ -245,6 +236,19 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         }
     }
 
+    let pixel_diff = sampled_difference(
+        previous,
+        current,
+        previous.height() - best.overlap,
+        0,
+        best.overlap,
+        SAMPLE_STEP,
+        focus_band_crop,
+    );
+    if pixel_diff > 12.0 {
+        return None;
+    }
+
     Some(best.overlap)
 }
 
@@ -323,13 +327,13 @@ fn match_overlap_candidate_multiscale(
         })
         .max_by(|a, b| a.score.total_cmp(&b.score))?;
 
-    if best_small.score < 0.80 {
+    if best_small.score < 0.70 {
         return None;
     }
 
     let estimate = best_small.overlap.saturating_mul(2);
-    let refine_min = estimate.saturating_sub(2).max(min_overlap);
-    let refine_max = (estimate + 2).min(max_overlap);
+    let refine_min = estimate.saturating_sub(4).max(min_overlap);
+    let refine_max = (estimate + 4).min(max_overlap);
     if refine_min > refine_max {
         return None;
     }
@@ -789,7 +793,7 @@ fn score_body_band(
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_text_body_band, detect_vertical_overlap, frames_are_similar, stitch_vertical};
+    use super::{detect_text_body_band, detect_vertical_overlap, frames_near_stagnant, stitch_vertical};
     use image::imageops::{self, crop_imm};
     use image::{Rgba, RgbaImage};
 
@@ -797,7 +801,7 @@ mod tests {
     fn duplicate_frames_are_detected() {
         let source = build_source(32, 80);
         let frame = crop(&source, 0, 40);
-        assert!(frames_are_similar(&frame, &frame));
+        assert!(frames_near_stagnant(&frame, &frame));
     }
 
     #[test]
@@ -849,10 +853,10 @@ mod tests {
 
     #[test]
     fn stitching_rebuilds_the_original_image() {
-        let source = build_source(40, 105);
-        let first = crop(&source, 0, 50);
-        let second = crop(&source, 20, 50);
-        let third = crop(&source, 55, 50);
+        let source = build_source(40, 115);
+        let first = crop(&source, 0, 60);
+        let second = crop(&source, 20, 60);
+        let third = crop(&source, 55, 60);
         let overlaps = vec![
             detect_vertical_overlap(&first, &second).unwrap(),
             detect_vertical_overlap(&second, &third).unwrap(),
@@ -997,9 +1001,9 @@ mod tests {
 
     #[test]
     fn vote_bands_partition_width_exactly_min_width() {
-        let bands = super::candidate_vote_bands(48);
+        let bands = super::candidate_vote_bands(64);
         assert_eq!(bands.len(), 1, "single band for width == MIN_VOTE_WINDOW_WIDTH");
-        assert!(bands[0].width() >= 48);
+        assert!(bands[0].width() >= 64);
     }
 
     #[test]
@@ -1092,29 +1096,6 @@ mod tests {
         let a = RgbaImage::from_pixel(48, 100, Rgba([200, 200, 200, 255]));
         let b = RgbaImage::from_pixel(48, 100, Rgba([100, 100, 100, 255]));
         assert_eq!(detect_vertical_overlap(&a, &b), None);
-    }
-
-    // ── frames_are_similar ──────────────────────────────────
-
-    #[test]
-    fn frames_are_similar_detects_identical() {
-        let source = build_source(32, 80);
-        let frame = crop(&source, 0, 40);
-        assert!(frames_are_similar(&frame, &frame));
-    }
-
-    #[test]
-    fn frames_are_similar_detects_different() {
-        let a = RgbaImage::from_pixel(32, 40, Rgba([200, 200, 200, 255]));
-        let b = RgbaImage::from_pixel(32, 40, Rgba([100, 100, 100, 255]));
-        assert!(!frames_are_similar(&a, &b));
-    }
-
-    #[test]
-    fn frames_are_similar_detects_different_sizes() {
-        let a = RgbaImage::from_pixel(32, 40, Rgba([128, 128, 128, 255]));
-        let b = RgbaImage::from_pixel(48, 40, Rgba([128, 128, 128, 255]));
-        assert!(!frames_are_similar(&a, &b));
     }
 
     // ── Stitching edge cases ────────────────────────────────
