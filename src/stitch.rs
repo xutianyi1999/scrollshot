@@ -15,7 +15,7 @@ const MIN_OVERLAP_RATIO: f32 = 0.02;
 const MAX_OVERLAP_RATIO: f32 = 0.995;
 const MIN_TEMPLATE_HEIGHT: u32 = 12;
 const TEMPLATE_HEIGHT_FACTORS: [u32; 9] = [1, 2, 3, 5, 8, 13, 21, 34, 55];
-const MATCH_SCORE_THRESHOLD: f32 = 0.72;
+const MATCH_SCORE_THRESHOLD: f32 = 0.78;
 const LOCAL_CONFIDENCE_DELTA: f32 = 0.006;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.003;
 const ALTERNATIVE_GAP: u32 = 4;
@@ -125,7 +125,7 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
             (previous_gray.clone(), current_gray.clone(), 0.0)
         };
     let (score_threshold, local_delta, global_delta) = {
-        let score = 0.68 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.68);
+        let score = 0.75 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.75);
         let local = 0.003 + texture_energy * (LOCAL_CONFIDENCE_DELTA - 0.003);
         let global = 0.001 + texture_energy * (GLOBAL_CONFIDENCE_DELTA - 0.001);
         (score, local, global)
