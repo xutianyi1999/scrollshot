@@ -106,7 +106,7 @@ fn detect_overlap_inner(
     let scrollbar_margin = ((previous.width() as f32 * SCROLLBAR_MARGIN_RATIO) as u32)
         .min(SCROLLBAR_MARGIN_MAX);
     let scrollbar_safe_right = previous.width().saturating_sub(scrollbar_margin);
-    let default_band = (scrollbar_safe_right > 0).then(|| HorizontalBand {
+    let default_band = (scrollbar_safe_right > 0).then_some(HorizontalBand {
         left: 0,
         right: scrollbar_safe_right,
     });
@@ -650,7 +650,6 @@ fn sampled_difference(
 }
 
 fn detect_text_body_band(image: &GrayImage) -> Option<HorizontalBand> {
-    let level = otsu_threshold(image)?;
     let left = image.width() / 10;
     let right = image.width().saturating_sub(left);
     if left >= right {
@@ -658,6 +657,11 @@ fn detect_text_body_band(image: &GrayImage) -> Option<HorizontalBand> {
     }
 
     let focus = crop_imm(image, left, 0, right - left, image.height()).to_image();
+    if focus.width() == 0 || focus.height() == 0 {
+        return None;
+    }
+
+    let level = otsu_level(&focus);
     let focus_binary = threshold(&focus, level, ThresholdType::BinaryInverted);
 
     let hist = histogram(&focus_binary);
@@ -686,21 +690,6 @@ fn detect_text_body_band(image: &GrayImage) -> Option<HorizontalBand> {
     let mut binary = GrayImage::new(image.width(), image.height());
     replace(&mut binary, &focus_binary, left as i64, 0);
     detect_body_band(&binary)
-}
-
-fn otsu_threshold(image: &GrayImage) -> Option<u8> {
-    let left = image.width() / 10;
-    let right = image.width().saturating_sub(left);
-    if left >= right {
-        return None;
-    }
-
-    let focus = crop_imm(image, left, 0, right - left, image.height()).to_image();
-    if focus.width() == 0 || focus.height() == 0 {
-        return None;
-    }
-
-    Some(otsu_level(&focus))
 }
 
 fn crop_gray_to_band(image: &GrayImage, band: Option<HorizontalBand>) -> GrayImage {

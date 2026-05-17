@@ -1,17 +1,12 @@
-use std::mem::size_of;
 use std::thread;
 use std::time::Duration;
 
-use windows::Win32::Foundation::POINT;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput,
+use enigo::{
+    Axis, Button, Coordinate, Direction::Click, Enigo, Mouse, Settings,
 };
-use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
 use crate::error::{AppError, AppResult};
 
-const WHEEL_DELTA: i32 = 120;
 const FOCUS_SETTLE_MS: u64 = 80;
 
 pub struct ScrollController;
@@ -21,55 +16,30 @@ impl ScrollController {
         Self
     }
 
-    pub fn focus_target(&self, point: POINT) -> AppResult<()> {
-        unsafe { SetCursorPos(point.x, point.y)? };
-
-        let input = [
-            mouse_input(MOUSE_EVENT_FLAGS(MOUSEEVENTF_LEFTDOWN.0), 0),
-            mouse_input(MOUSE_EVENT_FLAGS(MOUSEEVENTF_LEFTUP.0), 0),
-        ];
-        let sent = unsafe { SendInput(&input, size_of::<INPUT>() as i32) };
-        if sent != input.len() as u32 {
-            return Err(AppError::Message(
-                "SendInput failed to click the chosen scroll focus point".to_string(),
-            ));
-        }
+    pub fn focus_target(&self, point: (i32, i32)) -> AppResult<()> {
+        let mut enigo = Enigo::new(&Settings::default())
+            .map_err(|e| AppError::Message(format!("enigo init failed: {e}")))?;
+        enigo
+            .move_mouse(point.0, point.1, Coordinate::Abs)
+            .map_err(|e| AppError::Message(format!("move_mouse failed: {e}")))?;
+        enigo
+            .button(Button::Left, Click)
+            .map_err(|e| AppError::Message(format!("button click failed: {e}")))?;
 
         thread::sleep(Duration::from_millis(FOCUS_SETTLE_MS));
         Ok(())
     }
 
-    pub fn scroll_down_once(&self, point: POINT, notches: i32) -> AppResult<()> {
-        unsafe { SetCursorPos(point.x, point.y)? };
-
-        let input = [mouse_input(
-            MOUSE_EVENT_FLAGS(MOUSEEVENTF_WHEEL.0),
-            (-WHEEL_DELTA * notches) as u32,
-        )];
-        let sent = unsafe { SendInput(&input, size_of::<INPUT>() as i32) };
-        if sent != input.len() as u32 {
-            return Err(AppError::Message(
-                "SendInput failed to issue the downward mouse wheel event".to_string(),
-            ));
-        }
-
+    pub fn scroll_down_once(&self, point: (i32, i32), notches: i32) -> AppResult<()> {
+        let mut enigo = Enigo::new(&Settings::default())
+            .map_err(|e| AppError::Message(format!("enigo init failed: {e}")))?;
+        enigo
+            .move_mouse(point.0, point.1, Coordinate::Abs)
+            .map_err(|e| AppError::Message(format!("move_mouse failed: {e}")))?;
+        enigo
+            .scroll(notches, Axis::Vertical)
+            .map_err(|e| AppError::Message(format!("scroll failed: {e}")))?;
         Ok(())
     }
 
-}
-
-fn mouse_input(flags: MOUSE_EVENT_FLAGS, mouse_data: u32) -> INPUT {
-    INPUT {
-        r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 {
-            mi: MOUSEINPUT {
-                dx: 0,
-                dy: 0,
-                mouseData: mouse_data,
-                dwFlags: flags,
-                time: 0,
-                dwExtraInfo: 0,
-            },
-        },
-    }
 }

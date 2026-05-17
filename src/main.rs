@@ -10,10 +10,11 @@ use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
+use std::io::Write;
 
 use crate::capture::{CaptureBackend, ScreenCapture};
 use crate::cli::Cli;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::region::select_capture_region;
 use crate::scroll::ScrollController;
 use crate::stitch::{
@@ -28,8 +29,14 @@ use windows::Win32::UI::HiDpi::{
 const ESC_POLL_INTERVAL_MS: u64 = 25;
 
 fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    )
+    .format(|buf, record| writeln!(buf, "{}", record.args()))
+    .init();
+
     if let Err(error) = run() {
-        eprintln!("error: {error}");
+        log::error!("{error}");
         std::process::exit(1);
     }
 }
@@ -45,7 +52,7 @@ fn run() -> AppResult<()> {
 
     let capture = ScreenCapture::new(selection.rect)?;
     let scroller = ScrollController::new();
-    scroller.focus_target(selection.scroll_point)?;
+    scroller.focus_target((selection.scroll_point.x, selection.scroll_point.y))?;
 
     let mut frames = Vec::with_capacity(cli.max_scrolls.saturating_add(1));
     let mut overlaps = Vec::with_capacity(cli.max_scrolls);
@@ -56,13 +63,13 @@ fn run() -> AppResult<()> {
 
     for _ in 0..cli.max_scrolls {
         if capture_cancelled_by_escape() {
-            eprintln!("stopped early by Esc; saving the captured portion");
+            log::warn!("stopped early by Esc; saving the captured portion");
             break;
         }
 
-        scroller.scroll_down_once(selection.scroll_point, cli.wheel_notches)?;
+        scroller.scroll_down_once((selection.scroll_point.x, selection.scroll_point.y), cli.wheel_notches)?;
         if wait_for_scroll_settle_or_escape(cli.settle_ms) {
-            eprintln!("stopped early by Esc; saving the captured portion");
+            log::warn!("stopped early by Esc; saving the captured portion");
             break;
         }
         let next = capture.capture()?;
@@ -70,9 +77,8 @@ fn run() -> AppResult<()> {
 
         validate_frame_dimensions(previous, &next)?;
 
-        // Frames are highly similar → bottom reached.
         if frames_near_stagnant(previous, &next) {
-            eprintln!("info: reached page bottom");
+            log::info!("reached page bottom");
             break;
         }
 
@@ -91,13 +97,13 @@ fn run() -> AppResult<()> {
                 let avg = recent.iter().copied().sum::<u32>() as f64 / recent.len() as f64;
                 let deviation = (overlap as f64 - avg).abs() / avg.max(1.0);
                 if deviation > 0.01 {
-                    eprintln!("info: overlap {overlap}px deviates {:.1}% from recent pattern ({avg:.0}px); page bottom likely reached", deviation * 100.0);
+                    log::info!("overlap {overlap}px deviates {:.1}% from recent pattern ({avg:.0}px); page bottom likely reached", deviation * 100.0);
                     break;
                 }
             }
         } else if let Some(overlap) = estimate_overlap_from_history(&measured_overlaps, next.height()) {
-            eprintln!(
-                "info: continuing with estimated overlap {} from history ({} prior frames)",
+            log::info!(
+                "continuing with estimated overlap {} from history ({} prior frames)",
                 overlap,
                 measured_overlaps.len()
             );
@@ -105,13 +111,13 @@ fn run() -> AppResult<()> {
             frames.push(next);
             continue;
         } else if frames.len() == 1 {
-            return Err(AppError::OverlapNotFound);
+            return Err(crate::error::AppError::OverlapNotFound);
         } else {
-            eprintln!(
-                "warning: overlap detection became unreliable after {} frame(s); saving the captured portion",
+            log::warn!(
+                "overlap detection became unreliable after {} frame(s); saving the captured portion",
                 frames.len()
             );
-            eprintln!("info: [break: unreliable]");
+            log::info!("[break: unreliable]");
             break;
         }
     }
@@ -120,21 +126,21 @@ fn run() -> AppResult<()> {
     if !measured_overlaps.is_empty() {
         let recent: Vec<u32> = measured_overlaps.iter().rev().take(10).copied().rev().collect();
         let avg = measured_overlaps.iter().copied().sum::<u32>() as f64 / measured_overlaps.len() as f64;
-        eprintln!(
-            "info: {} overlaps ({} estimated), last 10 measured: {:?}, avg {:.1} px",
+        log::info!(
+            "{} overlaps ({} estimated), last 10 measured: {:?}, avg {:.1} px",
             overlaps.len(),
             estimate_count,
             recent,
             avg
         );
     } else {
-        eprintln!("info: {} overlaps (all estimated)", overlaps.len());
+        log::info!("{} overlaps (all estimated)", overlaps.len());
     }
 
     let stitched = stitch_vertical(&frames, &overlaps)?;
     stitched
         .save(&cli.output)
-        .map_err(|source| AppError::SaveImage {
+        .map_err(|source| crate::error::AppError::SaveImage {
             path: cli.output.clone(),
             source,
         })?;
@@ -170,7 +176,7 @@ fn wait_for_scroll_settle_or_escape(settle_ms: u64) -> bool {
 
 fn validate_frame_dimensions(previous: &image::RgbaImage, next: &image::RgbaImage) -> AppResult<()> {
     if previous.dimensions() != next.dimensions() {
-        return Err(AppError::FrameSizeChanged {
+        return Err(crate::error::AppError::FrameSizeChanged {
             expected_width: previous.width(),
             expected_height: previous.height(),
             actual_width: next.width(),
@@ -187,7 +193,7 @@ fn smooth_overlap(current: u32, measured: &[u32]) -> u32 {
         return current;
     }
     let recent = &measured[measured.len().saturating_sub(SMOOTHING_WINDOW - 1)..];
-    let mut sorted: Vec<u32> = recent.iter().copied().collect();
+    let mut sorted = recent.to_vec();
     sorted.push(current);
     sorted.sort_unstable();
     let median = sorted[sorted.len() / 2];

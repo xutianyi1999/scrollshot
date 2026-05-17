@@ -32,7 +32,7 @@ pub struct RegionSelection {
 }
 
 pub fn select_capture_region() -> AppResult<RegionSelection> {
-    println!("按住鼠标左键拖出截图区域，松开后在框内点击一次开始，按 Esc 取消。");
+    println!("Hold left mouse button to drag a region, then click inside it to start. Press Esc to cancel.");
 
     let previous_foreground = unsafe { GetForegroundWindow() };
     let module = unsafe { GetModuleHandleW(None)? };
@@ -178,11 +178,9 @@ unsafe extern "system" fn selection_overlay_proc(
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            if state.dragging {
-                if let Ok(cursor) = cursor_position() {
-                    state.current = Some(cursor);
-                    let _ = redraw_overlay(hwnd);
-                }
+            if state.dragging && let Ok(cursor) = cursor_position() {
+                state.current = Some(cursor);
+                let _ = redraw_overlay(hwnd);
             }
             LRESULT(0)
         }
@@ -248,10 +246,10 @@ fn paint_overlay(hwnd: HWND, state: &OverlayState) -> AppResult<()> {
             return Err(AppError::Windows(WindowsError::from_thread()));
         }
 
-        if let Some(rect) = state.client_selection_rect() {
-            if unsafe { FrameRect(hdc, &rect, border.handle) } == 0 {
-                return Err(AppError::Windows(WindowsError::from_thread()));
-            }
+        if let Some(rect) = state.client_selection_rect()
+            && unsafe { FrameRect(hdc, &rect, border.handle) } == 0
+        {
+            return Err(AppError::Windows(WindowsError::from_thread()));
         }
 
         Ok(())
