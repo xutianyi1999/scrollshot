@@ -76,7 +76,10 @@ fn run() -> AppResult<()> {
             break;
         }
 
-        if let Some(overlap) = detect_vertical_overlap(previous, &next) {
+        let avg_overlap = (!measured_overlaps.is_empty()).then(|| {
+            measured_overlaps.iter().copied().sum::<u32>() as f32 / measured_overlaps.len() as f32
+        });
+        if let Some(overlap) = detect_vertical_overlap(previous, &next, avg_overlap) {
             let smoothed = smooth_overlap(overlap, &measured_overlaps);
             overlaps.push(overlap);
             measured_overlaps.push(smoothed);

@@ -19,6 +19,7 @@ const MATCH_SCORE_THRESHOLD: f32 = 0.75;
 const LOCAL_CONFIDENCE_DELTA: f32 = 0.005;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.002;
 const ALTERNATIVE_GAP: u32 = 4;
+const HISTORY_BIAS_WEIGHT: f32 = 0.50;
 const OVERLAP_VOTE_TOLERANCE: u32 = 5;
 const MIN_VOTE_WINDOW_WIDTH: u32 = 48;
 
@@ -74,11 +75,19 @@ pub fn frames_near_stagnant(prev: &RgbaImage, curr: &RgbaImage) -> bool {
     ) <= 2.0
 }
 
-pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
-    detect_overlap_inner(previous, current)
+pub fn detect_vertical_overlap(
+    previous: &RgbaImage,
+    current: &RgbaImage,
+    expected_overlap: Option<f32>,
+) -> Option<u32> {
+    detect_overlap_inner(previous, current, expected_overlap)
 }
 
-fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
+fn detect_overlap_inner(
+    previous: &RgbaImage,
+    current: &RgbaImage,
+    expected_overlap: Option<f32>,
+) -> Option<u32> {
     if previous.width() != current.width() || previous.height() != current.height() {
         return None;
     }
@@ -182,6 +191,16 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
             .then_with(|| b.template_height.cmp(&a.template_height))
     });
 
+    if let Some(expected) = expected_overlap {
+        primary_candidates.sort_by(|a, b| {
+            let a_score = combine_with_bias(a.score, a.overlap, expected);
+            let b_score = combine_with_bias(b.score, b.overlap, expected);
+            b_score
+                .total_cmp(&a_score)
+                .then_with(|| b.template_height.cmp(&a.template_height))
+        });
+    }
+
     let best = *primary_candidates.first()?;
 
     if !sse_validate(
@@ -250,6 +269,12 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
     }
 
     Some(best.overlap)
+}
+
+fn combine_with_bias(score: f32, overlap: u32, expected: f32) -> f32 {
+    let distance = (overlap as f32 - expected).abs();
+    let proximity = (-distance / expected.max(1.0)).exp();
+    score * (1.0 - HISTORY_BIAS_WEIGHT) + proximity * HISTORY_BIAS_WEIGHT
 }
 
 pub fn stitch_vertical(frames: &[RgbaImage], overlaps: &[u32]) -> AppResult<RgbaImage> {
@@ -811,7 +836,7 @@ mod tests {
         let second = crop(&source, 23, 60);
 
         assert_eq!(
-            detect_vertical_overlap(&first, &second),
+            detect_vertical_overlap(&first, &second, None),
             Some(37)
         );
     }
@@ -823,7 +848,7 @@ mod tests {
         let third = crop(&source, 40, 60);
 
         assert_eq!(
-            detect_vertical_overlap(&second, &third),
+            detect_vertical_overlap(&second, &third, None),
             Some(45)
         );
     }
@@ -835,7 +860,7 @@ mod tests {
         let second = crop(&source, 2, 100);
 
         assert_eq!(
-            detect_vertical_overlap(&first, &second),
+            detect_vertical_overlap(&first, &second, None),
             Some(98)
         );
     }
@@ -846,7 +871,7 @@ mod tests {
         let second = RgbaImage::from_pixel(48, 120, Rgba([245, 245, 245, 255]));
 
         assert_eq!(
-            detect_vertical_overlap(&first, &second),
+            detect_vertical_overlap(&first, &second, None),
             None
         );
     }
@@ -858,8 +883,8 @@ mod tests {
         let second = crop(&source, 20, 60);
         let third = crop(&source, 55, 60);
         let overlaps = vec![
-            detect_vertical_overlap(&first, &second).unwrap(),
-            detect_vertical_overlap(&second, &third).unwrap(),
+            detect_vertical_overlap(&first, &second, None).unwrap(),
+            detect_vertical_overlap(&second, &third, None).unwrap(),
         ];
 
         let stitched = stitch_vertical(&[first, second, third], &overlaps).unwrap();
@@ -873,7 +898,7 @@ mod tests {
         let second = crop(&source, 18, 90);
 
         assert_eq!(
-            detect_vertical_overlap(&first, &second),
+            detect_vertical_overlap(&first, &second, None),
             Some(72)
         );
     }
@@ -898,7 +923,7 @@ mod tests {
         let second = crop(&source, 24, 120);
 
         assert_eq!(
-            detect_vertical_overlap(&first, &second),
+            detect_vertical_overlap(&first, &second, None),
             Some(96)
         );
     }
@@ -1052,7 +1077,7 @@ mod tests {
     fn overlap_detection_rejects_different_widths() {
         let a = RgbaImage::from_pixel(48, 100, Rgba([128, 128, 128, 255]));
         let b = RgbaImage::from_pixel(64, 100, Rgba([128, 128, 128, 255]));
-        assert_eq!(detect_vertical_overlap(&a, &b), None);
+        assert_eq!(detect_vertical_overlap(&a, &b, None), None);
     }
 
     #[test]
@@ -1060,7 +1085,7 @@ mod tests {
         let source = build_source(48, 200);
         let first = crop(&source, 0, 100);
         let second = crop(&source, 120, 100);
-        assert_eq!(detect_vertical_overlap(&first, &second), None);
+        assert_eq!(detect_vertical_overlap(&first, &second, None), None);
     }
 
     #[test]
@@ -1068,7 +1093,7 @@ mod tests {
         let source = build_source(48, 200);
         let first = crop(&source, 0, 160);
         let second = crop(&source, 1, 160);
-        let result = detect_vertical_overlap(&first, &second);
+        let result = detect_vertical_overlap(&first, &second, None);
         assert!(result.is_some());
         assert!(result.unwrap() > 150);
     }
@@ -1080,7 +1105,7 @@ mod tests {
         let source = build_source(48, 200);
         let first = crop(&source, 0, 100);
         let second = crop(&source, 10, 100);
-        assert_eq!(detect_vertical_overlap(&first, &second), Some(90));
+        assert_eq!(detect_vertical_overlap(&first, &second, None), Some(90));
     }
 
     #[test]
@@ -1088,14 +1113,14 @@ mod tests {
         let source = build_striped_source(48, 160);
         let first = crop(&source, 0, 80);
         let second = crop(&source, 12, 80);
-        assert_eq!(detect_vertical_overlap(&first, &second), Some(68));
+        assert_eq!(detect_vertical_overlap(&first, &second, None), Some(68));
     }
 
     #[test]
     fn overlap_detection_rejects_uniform_different_colors() {
         let a = RgbaImage::from_pixel(48, 100, Rgba([200, 200, 200, 255]));
         let b = RgbaImage::from_pixel(48, 100, Rgba([100, 100, 100, 255]));
-        assert_eq!(detect_vertical_overlap(&a, &b), None);
+        assert_eq!(detect_vertical_overlap(&a, &b, None), None);
     }
 
     // ── Stitching edge cases ────────────────────────────────
