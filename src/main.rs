@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::region::select_capture_region;
 use crate::scroll::ScrollController;
 use crate::stitch::{
-    detect_vertical_overlap, frames_are_similar, frames_static_across_gap, stitch_vertical,
+    detect_vertical_overlap, frames_near_stagnant, stitch_vertical,
 };
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
@@ -25,7 +25,6 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 
-const MAX_STAGNANT_SCROLLS: usize = 1;
 const ESC_POLL_INTERVAL_MS: u64 = 25;
 
 fn main() {
@@ -51,8 +50,6 @@ fn run() -> AppResult<()> {
     let mut frames = Vec::with_capacity(cli.max_scrolls.saturating_add(1));
     let mut overlaps = Vec::with_capacity(cli.max_scrolls);
     let mut measured_overlaps = Vec::with_capacity(cli.max_scrolls);
-    let mut stagnant_scrolls = 0usize;
-    let mut filler_frames = 0usize;
 
     let first = capture.capture()?;
     frames.push(first);
@@ -73,32 +70,13 @@ fn run() -> AppResult<()> {
 
         validate_frame_dimensions(previous, &next)?;
 
-        if frames_are_similar(previous, &next) {
-            stagnant_scrolls += 1;
-            if stagnant_scrolls >= MAX_STAGNANT_SCROLLS {
-                break;
-            }
-            continue;
-        }
-        stagnant_scrolls = 0;
-
-        // Stuck-with-noise detection (both paths): frames barely change
-        if frames_static_across_gap(previous, &next) {
-            filler_frames += 1;
-            if filler_frames >= 20 {
-                eprintln!("info: reached page bottom");
-                break;
-            }
-        } else {
-            filler_frames = 0;
+        // Frames are highly similar → bottom reached.
+        if frames_near_stagnant(previous, &next) {
+            eprintln!("info: reached page bottom");
+            break;
         }
 
         if let Some(overlap) = detect_vertical_overlap(previous, &next) {
-            // Raw overlap close to full frame height → page stopped scrolling
-            if overlap as f32 >= next.height() as f32 * 0.98 {
-                eprintln!("info: reached page bottom");
-                break;
-            }
             let overlap = smooth_overlap(overlap, &measured_overlaps);
             overlaps.push(overlap);
             measured_overlaps.push(overlap);
@@ -119,6 +97,7 @@ fn run() -> AppResult<()> {
                 "warning: overlap detection became unreliable after {} frame(s); saving the captured portion",
                 frames.len()
             );
+            eprintln!("info: [break: unreliable]");
             break;
         }
     }
@@ -223,12 +202,7 @@ fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{smooth_overlap, MAX_STAGNANT_SCROLLS};
-
-    #[test]
-    fn stop_threshold_prevents_immediate_break() {
-        assert!(MAX_STAGNANT_SCROLLS >= 1);
-    }
+    use super::smooth_overlap;
 
     #[test]
     fn smooth_overlap_passes_through_normal_values() {

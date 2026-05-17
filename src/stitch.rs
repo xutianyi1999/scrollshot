@@ -67,34 +67,20 @@ pub fn frames_are_similar(previous: &RgbaImage, current: &RgbaImage) -> bool {
     if previous.dimensions() != current.dimensions() {
         return false;
     }
-
     sampled_difference(
-        previous,
-        current,
-        0,
-        0,
-        previous.height(),
-        SAMPLE_STEP * 2,
-        None,
+        previous, current, 0, 0, previous.height(), SAMPLE_STEP * 2, None,
     ) <= IDENTICAL_THRESHOLD
 }
 
-/// Relaxed similarity check for detecting that no meaningful content change
-/// occurred across a gap of multiple frames (e.g. stuck at bottom).
-pub fn frames_static_across_gap(prev: &RgbaImage, curr: &RgbaImage) -> bool {
+/// Check whether two consecutive frames are nearly identical (relaxed
+/// threshold) — used as a safety net for noisy stuck-at-bottom detection.
+pub fn frames_near_stagnant(prev: &RgbaImage, curr: &RgbaImage) -> bool {
     if prev.dimensions() != curr.dimensions() {
         return false;
     }
-
     sampled_difference(
-        prev,
-        curr,
-        0,
-        0,
-        prev.height(),
-        SAMPLE_STEP * 2,
-        None,
-    ) <= 3.0
+        prev, curr, 0, 0, prev.height(), SAMPLE_STEP, None,
+    ) <= 8.0
 }
 
 pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
