@@ -2,7 +2,6 @@ use image::imageops::{self, crop_imm, replace};
 use image::{GrayImage, Luma, RgbaImage};
 use imageproc::contrast::{otsu_level, threshold, ThresholdType};
 use imageproc::gradients::sobel_gradients;
-use imageproc::stats::histogram;
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template};
 
 use average::{Estimate, Variance};
@@ -125,13 +124,14 @@ fn detect_overlap_inner(
         };
 
     let template_heights = candidate_template_heights(min_overlap, max_overlap);
+    let search_region = crop_imm(&current_map, 0, 0, current_map.width(), max_overlap).to_image();
     let mut primary_candidates: Vec<MatchCandidate> = template_heights
         .par_iter()
         .copied()
         .filter_map(|template_height| {
             match_overlap_candidate(
                 &previous_map,
-                &current_map,
+                &search_region,
                 template_height,
                 min_overlap,
                 max_overlap,
@@ -244,7 +244,7 @@ fn candidate_template_heights(min_overlap: u32, max_overlap: u32) -> Vec<u32> {
 }
 fn match_overlap_candidate(
     previous: &GrayImage,
-    current: &GrayImage,
+    search_region: &GrayImage,
     template_height: u32,
     min_overlap: u32,
     max_overlap: u32,
@@ -257,10 +257,9 @@ fn match_overlap_candidate(
         template_height,
     )
     .to_image();
-    let search_region = crop_imm(current, 0, 0, current.width(), max_overlap).to_image();
 
     let response = match_template(
-        &search_region,
+        search_region,
         &template,
         MatchTemplateMethod::CrossCorrelationNormalized,
     );
@@ -317,8 +316,10 @@ fn to_feature_map_from_gray(grayscale: &GrayImage, band: Option<HorizontalBand>)
     let gradients = sobel_gradients(&grayscale);
 
     let mut max_gradient = 0u16;
+    let mut stats = Variance::new();
     for p in gradients.pixels() {
         let v = p[0];
+        stats.add(v as f64);
         if v > max_gradient {
             max_gradient = v;
         }
@@ -327,11 +328,6 @@ fn to_feature_map_from_gray(grayscale: &GrayImage, band: Option<HorizontalBand>)
     if max_gradient == 0 {
         let blank = GrayImage::new(grayscale.width(), grayscale.height());
         return (blank, false);
-    }
-
-    let mut stats = Variance::new();
-    for p in gradients.pixels() {
-        stats.add(p[0] as f64);
     }
     let mean = stats.mean() as f32;
     let stddev = stats.sample_variance().sqrt() as f32;
@@ -401,21 +397,17 @@ fn detect_text_body_band(image: &GrayImage) -> Option<HorizontalBand> {
     let level = otsu_level(&focus);
     let focus_binary = threshold(&focus, level, ThresholdType::BinaryInverted);
 
-    let hist = histogram(&focus_binary);
-    let ink_pixels = hist.channels[0][255];
-    let total = focus_binary.width() * focus_binary.height();
-    let ink_ratio = ink_pixels as f32 / total as f32;
-
-    if 1.0 - ink_ratio < TEXT_PAGE_MIN_BRIGHT_RATIO || ink_ratio > TEXT_PAGE_MAX_INK_RATIO {
-        return None;
-    }
-
     let mut row_ink = Vec::new();
     for y in 0..focus_binary.height() {
         let count = (0..focus_binary.width())
             .filter(|x| focus_binary.get_pixel(*x, y)[0] > 0)
             .count() as u32;
         row_ink.push(count as f32 / focus_binary.width() as f32);
+    }
+
+    let ink_ratio = row_ink.iter().sum::<f32>() / row_ink.len() as f32;
+    if 1.0 - ink_ratio < TEXT_PAGE_MIN_BRIGHT_RATIO || ink_ratio > TEXT_PAGE_MAX_INK_RATIO {
+        return None;
     }
 
     let row_stats: Variance = row_ink.iter().map(|v| *v as f64).collect();
