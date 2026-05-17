@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::region::select_capture_region;
 use crate::scroll::ScrollController;
 use crate::stitch::{
-    detect_vertical_overlap, frames_are_similar, overlap_region_diff, stitch_vertical, IDENTICAL_THRESHOLD,
+    detect_vertical_overlap, frames_are_similar, frames_static_across_gap, stitch_vertical,
 };
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
@@ -25,7 +25,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 
-const MAX_STAGNANT_SCROLLS: usize = 3;
+const MAX_STAGNANT_SCROLLS: usize = 1;
 const ESC_POLL_INTERVAL_MS: u64 = 25;
 
 fn main() {
@@ -52,6 +52,7 @@ fn run() -> AppResult<()> {
     let mut overlaps = Vec::with_capacity(cli.max_scrolls);
     let mut measured_overlaps = Vec::with_capacity(cli.max_scrolls);
     let mut stagnant_scrolls = 0usize;
+    let mut filler_frames = 0usize;
 
     let first = capture.capture()?;
     frames.push(first);
@@ -81,18 +82,28 @@ fn run() -> AppResult<()> {
         }
         stagnant_scrolls = 0;
 
+        // Stuck-with-noise detection (both paths): frames barely change
+        if frames_static_across_gap(previous, &next) {
+            filler_frames += 1;
+            if filler_frames >= 20 {
+                eprintln!("info: reached page bottom");
+                break;
+            }
+        } else {
+            filler_frames = 0;
+        }
+
         if let Some(overlap) = detect_vertical_overlap(previous, &next) {
+            // Raw overlap close to full frame height → page stopped scrolling
+            if overlap as f32 >= next.height() as f32 * 0.98 {
+                eprintln!("info: reached page bottom");
+                break;
+            }
             let overlap = smooth_overlap(overlap, &measured_overlaps);
             overlaps.push(overlap);
             measured_overlaps.push(overlap);
             frames.push(next);
         } else if let Some(overlap) = estimate_overlap_from_history(&measured_overlaps, next.height()) {
-            // Verify the estimate: the overlapping region should match.
-            // If it doesn't (diff > threshold), content stopped advancing.
-            if overlap_region_diff(previous, &next, overlap) > IDENTICAL_THRESHOLD * 5.0 {
-                eprintln!("info: reached page bottom");
-                break;
-            }
             eprintln!(
                 "info: continuing with estimated overlap {} from history ({} prior frames)",
                 overlap,
@@ -196,7 +207,7 @@ fn smooth_overlap(current: u32, measured: &[u32]) -> u32 {
 
 fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<u32> {
     let recent: Vec<u32> = overlaps.iter().rev().take(10).copied().collect();
-    if recent.len() < 3 {
+    if recent.len() < 2 {
         return None;
     }
     let mut sorted = recent;
@@ -216,7 +227,7 @@ mod tests {
 
     #[test]
     fn stop_threshold_prevents_immediate_break() {
-        assert!(MAX_STAGNANT_SCROLLS > 1);
+        assert!(MAX_STAGNANT_SCROLLS >= 1);
     }
 
     #[test]

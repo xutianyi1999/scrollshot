@@ -11,12 +11,12 @@ use rayon::prelude::*;
 use crate::error::{AppError, AppResult};
 
 const SAMPLE_STEP: u32 = 4;
-pub(crate) const IDENTICAL_THRESHOLD: f32 = 1.5;
+pub(crate) const IDENTICAL_THRESHOLD: f32 = 1.0;
 const MIN_OVERLAP_RATIO: f32 = 0.02;
 const MAX_OVERLAP_RATIO: f32 = 0.995;
 const MIN_TEMPLATE_HEIGHT: u32 = 8;
 const TEMPLATE_HEIGHT_FACTORS: [u32; 7] = [1, 2, 3, 5, 8, 13, 21];
-const MATCH_SCORE_THRESHOLD: f32 = 0.94;
+const MATCH_SCORE_THRESHOLD: f32 = 0.92;
 const LOCAL_CONFIDENCE_DELTA: f32 = 0.01;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.005;
 const ALTERNATIVE_GAP: u32 = 4;
@@ -33,7 +33,7 @@ const TEXT_BODY_MIN_WIDTH_RATIO: f32 = 0.18;
 const TEXT_BODY_PADDING_RATIO: f32 = 0.03;
 const SCROLLBAR_MARGIN_RATIO: f32 = 0.012;
 const SCROLLBAR_MARGIN_MAX: u32 = 24;
-const SSE_VALIDATE_THRESHOLD: f32 = 0.82;
+const SSE_VALIDATE_THRESHOLD: f32 = 0.78;
 
 #[derive(Clone, Copy, Debug)]
 struct MatchCandidate {
@@ -79,20 +79,22 @@ pub fn frames_are_similar(previous: &RgbaImage, current: &RgbaImage) -> bool {
     ) <= IDENTICAL_THRESHOLD
 }
 
-/// Returns the mean pixel difference in the overlapping region defined by
-/// `estimated_overlap` (the bottom `overlap` rows of `previous` vs. the top
-/// `overlap` rows of `current`). A high value indicates the estimate is
-/// incorrect, e.g. when the page has stopped scrolling.
-pub fn overlap_region_diff(previous: &RgbaImage, current: &RgbaImage, overlap: u32) -> f32 {
+/// Relaxed similarity check for detecting that no meaningful content change
+/// occurred across a gap of multiple frames (e.g. stuck at bottom).
+pub fn frames_static_across_gap(prev: &RgbaImage, curr: &RgbaImage) -> bool {
+    if prev.dimensions() != curr.dimensions() {
+        return false;
+    }
+
     sampled_difference(
-        previous,
-        current,
-        previous.height() - overlap,
+        prev,
+        curr,
         0,
-        overlap,
+        0,
+        prev.height(),
         SAMPLE_STEP * 2,
         None,
-    )
+    ) <= 3.0
 }
 
 pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
