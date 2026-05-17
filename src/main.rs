@@ -225,6 +225,9 @@ fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<
     let median = sorted[sorted.len() / 2];
     let min_allowed = (frame_height as f32 * 0.01).max(4.0) as u32;
     let max_allowed = frame_height.saturating_sub(2);
+    if min_allowed > max_allowed {
+        return None;
+    }
     Some(median.clamp(min_allowed, max_allowed))
 }
 
