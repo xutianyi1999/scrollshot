@@ -150,6 +150,15 @@ fn run() -> AppResult<()> {
         }
     }
 
+    let avg = overlaps.iter().copied().sum::<u32>() as f64 / overlaps.len() as f64;
+    let recent: Vec<u32> = overlaps.iter().rev().take(10).copied().rev().collect();
+    eprintln!(
+        "info: {} frames, last 10: {:?}, avg {:.1} px",
+        overlaps.len(),
+        recent,
+        avg
+    );
+
     let stitched = stitch_vertical(&frames, &overlaps)?;
     stitched
         .save(&cli.output)
