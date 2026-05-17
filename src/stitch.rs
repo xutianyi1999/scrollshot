@@ -773,16 +773,20 @@ fn smooth_density(values: &[f32], radius: usize) -> Vec<f32> {
     if n == 0 {
         return Vec::new();
     }
-    let mut out = vec![0f32; n];
-    let mut running = 0f32;
+    let initial_right = radius.min(n - 1);
+    let mut running: f32 = values[..=initial_right].iter().sum();
+    let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        if i + radius < n {
-            running += values[i + radius];
-        }
-        let effective_len = (n.min(i + radius + 1) - i.saturating_sub(radius)) as f32;
-        out[i] = running / effective_len;
-        if i >= radius {
-            running -= values[i - radius];
+        let left = i.saturating_sub(radius);
+        let right = (i + radius).min(n - 1);
+        out.push(running / (right - left + 1) as f32);
+        if i + 1 < n {
+            if i + radius + 1 < n {
+                running += values[i + radius + 1];
+            }
+            if i >= radius {
+                running -= values[i - radius];
+            }
         }
     }
     out
