@@ -211,10 +211,26 @@ fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::MAX_STAGNANT_SCROLLS;
+    use super::{smooth_overlap, MAX_STAGNANT_SCROLLS};
 
     #[test]
     fn stop_threshold_prevents_immediate_break() {
         assert!(MAX_STAGNANT_SCROLLS > 1);
+    }
+
+    #[test]
+    fn smooth_overlap_passes_through_normal_values() {
+        assert_eq!(smooth_overlap(100, &[98, 99, 101]), 100);
+    }
+
+    #[test]
+    fn smooth_overlap_clamps_single_frame_outlier() {
+        assert_eq!(smooth_overlap(200, &[98, 99, 101]), 101);
+    }
+
+    #[test]
+    fn smooth_overlap_requires_no_history() {
+        assert_eq!(smooth_overlap(100, &[]), 100);
+        assert_eq!(smooth_overlap(100, &[90]), 100);
     }
 }

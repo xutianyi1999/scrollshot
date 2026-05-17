@@ -1,7 +1,8 @@
 use image::imageops::{self, crop_imm, replace};
 use image::{GrayImage, Luma, RgbaImage};
-use imageproc::contrast::otsu_level;
+use imageproc::contrast::{otsu_level, threshold, ThresholdType};
 use imageproc::gradients::sobel_gradients;
+use imageproc::stats::histogram;
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template};
 
 use average::{Estimate, Mean, Variance};
@@ -86,11 +87,9 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         return None;
     }
 
-    let content_height = previous.height();
-    let min_overlap =
-        ((content_height as f32) * MIN_OVERLAP_RATIO).max(MIN_TEMPLATE_HEIGHT as f32) as u32;
-    let max_overlap = ((content_height as f32) * MAX_OVERLAP_RATIO)
-        .min(content_height.saturating_sub(1) as f32) as u32;
+    let h = previous.height() as f32;
+    let min_overlap = (h * MIN_OVERLAP_RATIO).max(MIN_TEMPLATE_HEIGHT as f32) as u32;
+    let max_overlap = (h * MAX_OVERLAP_RATIO).min(h - 1.0) as u32;
 
     if min_overlap > max_overlap {
         return None;
@@ -243,14 +242,16 @@ pub fn stitch_vertical(frames: &[RgbaImage], overlaps: &[u32]) -> AppResult<Rgba
 }
 
 fn candidate_template_heights(min_overlap: u32, max_overlap: u32) -> Vec<u32> {
-    let mut heights = TEMPLATE_HEIGHT_FACTORS
+    let mut heights: Vec<u32> = TEMPLATE_HEIGHT_FACTORS
         .iter()
         .map(|factor| min_overlap.saturating_mul(*factor))
-        .collect::<Vec<_>>();
-    heights.push(MIN_TEMPLATE_HEIGHT.max(min_overlap));
-    heights.retain(|height| *height >= min_overlap && *height <= max_overlap);
+        .filter(|h| *h <= max_overlap)
+        .collect();
+    let min_height = MIN_TEMPLATE_HEIGHT.max(min_overlap);
+    if min_height <= max_overlap && !heights.contains(&min_height) {
+        heights.push(min_height);
+    }
     heights.sort_unstable();
-    heights.dedup();
     heights
 }
 
@@ -311,7 +312,7 @@ fn candidate_vote_bands(width: u32) -> Vec<HorizontalBand> {
         return bands;
     }
 
-    let band_count = 5u32.min(width / MIN_VOTE_WINDOW_WIDTH).max(2);
+    let band_count = 5u32.min(width / MIN_VOTE_WINDOW_WIDTH).max(1);
     let base_band_width = width / band_count;
 
     for i in 0..band_count {
@@ -511,18 +512,12 @@ fn best_alternative_score(
 }
 
 fn mean_and_stddev(values: &[f32]) -> (f32, f32) {
-    let mut stats = Variance::new();
-    for v in values.iter().copied() {
-        stats.add(v as f64);
-    }
+    let stats: Variance = values.iter().map(|v| *v as f64).collect();
     (stats.mean() as f32, stats.sample_variance().sqrt() as f32)
 }
 
 fn estimate_texture_energy(image: &GrayImage) -> f32 {
-    let mut m = Mean::new();
-    for p in image.pixels() {
-        m.add(p[0] as f64);
-    }
+    let m: Mean = image.pixels().map(|p| p[0] as f64).collect();
     (m.mean() as f32) / 255.0
 }
 
@@ -545,15 +540,23 @@ fn to_feature_map(image: &RgbaImage, band: Option<HorizontalBand>) -> (GrayImage
     let grayscale = imageops::grayscale(image);
     let grayscale = crop_gray_to_band(&grayscale, band);
     let gradients = sobel_gradients(&grayscale);
-    let pixels: Vec<u16> = gradients.pixels().map(|p| p[0]).collect();
-    let max_gradient = pixels.iter().max().copied().unwrap_or(0);
+
+    let mut stats = Variance::new();
+    let mut max_gradient = 0u16;
+    for p in gradients.pixels() {
+        let v = p[0];
+        stats.add(v as f64);
+        if v > max_gradient {
+            max_gradient = v;
+        }
+    }
 
     if max_gradient == 0 {
         return (GrayImage::new(grayscale.width(), grayscale.height()), false);
     }
 
-    let pixel_f32: Vec<f32> = pixels.iter().copied().map(|v| v as f32).collect();
-    let (mean, stddev) = mean_and_stddev(&pixel_f32);
+    let mean = stats.mean() as f32;
+    let stddev = stats.sample_variance().sqrt() as f32;
     let normalizer = (mean + 3.0 * stddev).max(1.0);
 
     (
@@ -601,43 +604,31 @@ fn sampled_difference(
 }
 
 fn detect_text_body_band(image: &GrayImage) -> Option<HorizontalBand> {
-    let threshold = otsu_threshold(image)?;
+    let level = otsu_threshold(image)?;
     let left = image.width() / 10;
     let right = image.width().saturating_sub(left);
     if left >= right {
         return None;
     }
 
-    let mut total_pixels = 0u32;
-    let mut bright_pixels = 0u32;
-    let mut ink_pixels = 0u32;
+    let focus = crop_imm(image, left, 0, right - left, image.height()).to_image();
+    let focus_binary = threshold(&focus, level, ThresholdType::BinaryInverted);
+
+    let hist = histogram(&focus_binary);
+    let ink_pixels = hist.channels[0][255];
+    let total = focus_binary.width() * focus_binary.height();
+    let ink_ratio = ink_pixels as f32 / total as f32;
+
+    if 1.0 - ink_ratio < TEXT_PAGE_MIN_BRIGHT_RATIO || ink_ratio > TEXT_PAGE_MAX_INK_RATIO {
+        return None;
+    }
+
     let mut row_ink = Vec::new();
-    let mut binary = GrayImage::new(image.width(), image.height());
-
-    for y in 0..image.height() {
-        let mut row_ink_count = 0u32;
-        for x in left..right {
-            let value = image.get_pixel(x, y)[0];
-            total_pixels += 1;
-            if value >= threshold {
-                bright_pixels += 1;
-            } else {
-                ink_pixels += 1;
-                row_ink_count += 1;
-                binary.put_pixel(x, y, Luma([255]));
-            }
-        }
-        row_ink.push(row_ink_count as f32 / (right - left) as f32);
-    }
-
-    if total_pixels == 0 {
-        return None;
-    }
-
-    let bright_ratio = bright_pixels as f32 / total_pixels as f32;
-    let ink_ratio = ink_pixels as f32 / total_pixels as f32;
-    if bright_ratio < TEXT_PAGE_MIN_BRIGHT_RATIO || ink_ratio > TEXT_PAGE_MAX_INK_RATIO {
-        return None;
+    for y in 0..focus_binary.height() {
+        let count = (0..focus_binary.width())
+            .filter(|x| focus_binary.get_pixel(*x, y)[0] > 0)
+            .count() as u32;
+        row_ink.push(count as f32 / focus_binary.width() as f32);
     }
 
     let (_, row_stddev) = mean_and_stddev(&row_ink);
@@ -645,6 +636,8 @@ fn detect_text_body_band(image: &GrayImage) -> Option<HorizontalBand> {
         return None;
     }
 
+    let mut binary = GrayImage::new(image.width(), image.height());
+    replace(&mut binary, &focus_binary, left as i64, 0);
     detect_body_band(&binary)
 }
 
@@ -711,19 +704,17 @@ fn detect_body_band(binary: &GrayImage) -> Option<HorizontalBand> {
 
     let mut density = vec![0f32; width as usize];
     for x in search_left..search_right {
-        let mut ink = 0u32;
-        for y in 0..binary.height() {
-            if binary.get_pixel(x, y)[0] > 0 {
-                ink += 1;
-            }
-        }
+        let ink = (0..binary.height())
+            .filter(|y| binary.get_pixel(x, *y)[0] > 0)
+            .count();
         density[x as usize] = ink as f32 / height as f32;
     }
     let smoothed = smooth_density(&density, 2);
     let peak = smoothed[search_left as usize..search_right as usize]
         .iter()
         .copied()
-        .fold(0.0, f32::max);
+        .max_by(|a, b| a.total_cmp(b))
+        .unwrap_or(0.0);
     if peak < TEXT_BODY_MIN_DENSITY {
         return None;
     }
@@ -788,14 +779,10 @@ fn score_body_band(
     preferred_center: f32,
     width: f32,
 ) -> f32 {
-    let mut mass = 0f32;
-    for x in start..end {
-        mass += density[x as usize];
-    }
+    let mass: f32 = density[start as usize..end as usize].iter().sum();
     let center = (start + end) as f32 / 2.0;
     let center_distance = ((center - preferred_center).abs() / (width / 2.0)).clamp(0.0, 1.0);
-    let center_bonus = 1.0 - center_distance * 0.2;
-    mass * center_bonus
+    mass * (1.0 - center_distance * 0.2)
 }
 
 fn pixel_difference(a: [u8; 4], b: [u8; 4]) -> f32 {
@@ -1011,6 +998,55 @@ mod tests {
             }
         }
         image
+    }
+
+    // ── candidate_vote_bands ────────────────────────────────
+
+    #[test]
+    fn vote_bands_partition_width_exactly_min_width() {
+        let bands = super::candidate_vote_bands(48);
+        assert_eq!(bands.len(), 1, "single band for width == MIN_VOTE_WINDOW_WIDTH");
+        assert!(bands[0].width() >= 48);
+    }
+
+    #[test]
+    fn vote_bands_partition_non_overlapping() {
+        let bands = super::candidate_vote_bands(500);
+        assert!(bands.len() >= 3, "should partition wide images into 3+ bands");
+        for w in bands.windows(2) {
+            assert!(w[0].right <= w[1].left, "bands must not overlap");
+        }
+    }
+
+    #[test]
+    fn vote_bands_return_empty_for_narrow_width() {
+        assert!(super::candidate_vote_bands(47).is_empty());
+    }
+
+    // ── Scrollbar exclusion ─────────────────────────────────
+
+    fn build_scrollbar_source(width: u32, height: u32) -> RgbaImage {
+        let right_start = width.saturating_sub(24);
+        let mut image = build_document_like_source(width, height);
+        for y in 0..height {
+            for x in right_start..width {
+                let v = if ((y / 4) + (x / 4)) % 2 == 0 { 200u8 } else { 180u8 };
+                image.put_pixel(x, y, Rgba([v, v, v, 255]));
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn scrollbar_margin_excludes_right_region() {
+        let src = build_scrollbar_source(120, 160);
+        let first = crop(&src, 0, 80);
+        let second = crop(&src, 12, 80);
+        let band = super::shared_text_body_band(&first, &second);
+        assert!(band.is_some(), "text body band should be detected");
+        if let Some(b) = band {
+            assert!(b.right < 115, "scrollbar margin should exclude right ~1.2%");
+        }
     }
 
     // ── Edge cases ──────────────────────────────────────────
