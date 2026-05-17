@@ -82,8 +82,9 @@ fn run() -> AppResult<()> {
             break;
         }
 
-        let avg_overlap = (!measured_overlaps.is_empty()).then(|| {
-            measured_overlaps.iter().copied().sum::<u32>() as f32 / measured_overlaps.len() as f32
+        let recent_overlaps: Vec<u32> = measured_overlaps.iter().rev().take(5).copied().collect();
+        let avg_overlap = (!recent_overlaps.is_empty()).then(|| {
+            recent_overlaps.iter().copied().sum::<u32>() as f32 / recent_overlaps.len() as f32
         });
         if let Some(overlap) = detect_vertical_overlap(previous, &next, avg_overlap) {
             let smoothed = smooth_overlap(overlap, &measured_overlaps);
@@ -92,9 +93,7 @@ fn run() -> AppResult<()> {
             frames.push(next);
 
             if measured_overlaps.len() >= 4 {
-                let count = measured_overlaps.len() - 1;
-                let recent: Vec<u32> = measured_overlaps[..count].iter().rev().take(5).copied().collect();
-                let avg = recent.iter().copied().sum::<u32>() as f64 / recent.len() as f64;
+                let avg = recent_overlaps.iter().copied().sum::<u32>() as f64 / recent_overlaps.len() as f64;
                 let deviation = (overlap as f64 - avg).abs() / avg.max(1.0);
                 if deviation > 0.01 {
                     log::info!("overlap {overlap}px deviates {:.1}% from recent pattern ({avg:.0}px); page bottom likely reached", deviation * 100.0);

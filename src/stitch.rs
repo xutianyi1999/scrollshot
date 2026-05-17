@@ -14,14 +14,12 @@ const SAMPLE_STEP: u32 = 2;
 const MIN_OVERLAP_RATIO: f32 = 0.02;
 const MAX_OVERLAP_RATIO: f32 = 0.995;
 const MIN_TEMPLATE_HEIGHT: u32 = 12;
-const TEMPLATE_HEIGHT_FACTORS: [u32; 9] = [1, 2, 3, 5, 8, 13, 21, 34, 55];
+const TEMPLATE_HEIGHT_FACTORS: [u32; 5] = [1, 2, 3, 5, 8];
 const MATCH_SCORE_THRESHOLD: f32 = 0.75;
 const LOCAL_CONFIDENCE_DELTA: f32 = 0.005;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.002;
 const ALTERNATIVE_GAP: u32 = 4;
 const HISTORY_BIAS_WEIGHT: f32 = 0.50;
-const OVERLAP_VOTE_TOLERANCE: u32 = 5;
-const MIN_VOTE_WINDOW_WIDTH: u32 = 48;
 
 const TEXT_PAGE_MIN_BRIGHT_RATIO: f32 = 0.7;
 const TEXT_PAGE_MAX_INK_RATIO: f32 = 0.22;
@@ -33,7 +31,6 @@ const TEXT_BODY_MIN_WIDTH_RATIO: f32 = 0.18;
 const TEXT_BODY_PADDING_RATIO: f32 = 0.03;
 const SCROLLBAR_MARGIN_RATIO: f32 = 0.012;
 const SCROLLBAR_MARGIN_MAX: u32 = 24;
-const SSE_VALIDATE_THRESHOLD: f32 = 0.65;
 
 #[derive(Clone, Copy, Debug)]
 struct MatchCandidate {
@@ -43,13 +40,6 @@ struct MatchCandidate {
     template_height: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct OverlapVote {
-    overlap: u32,
-    votes: usize,
-    best_score: f32,
-    average_score: f32,
-}
 
 #[derive(Clone, Copy, Debug)]
 struct HorizontalBand {
@@ -122,68 +112,32 @@ fn detect_overlap_inner(
         .or(default_band);
 
     let focus_band_crop = focus_band.and_then(|band| normalized_band(Some(band), previous.width()));
-    let (previous_map, previous_has_features, tex_energy) =
+    let (previous_map, previous_has_features) =
         to_feature_map_from_gray(&previous_gray, focus_band_crop);
-    let (current_map, current_has_features, _) =
+    let (current_map, current_has_features) =
         to_feature_map_from_gray(&current_gray, focus_band_crop);
 
-    let (previous_map, current_map, texture_energy) =
+    let (previous_map, current_map) =
         if previous_has_features && current_has_features {
-            (previous_map, current_map, tex_energy)
+            (previous_map, current_map)
         } else {
-            (previous_gray.clone(), current_gray.clone(), 0.0)
+            (previous_gray.clone(), current_gray.clone())
         };
-    let (score_threshold, local_delta, global_delta) = {
-        let score = 0.75 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.75);
-        let local = 0.003 + texture_energy * (LOCAL_CONFIDENCE_DELTA - 0.003);
-        let global = 0.001 + texture_energy * (GLOBAL_CONFIDENCE_DELTA - 0.001);
-        (score, local, global)
-    };
 
     let template_heights = candidate_template_heights(min_overlap, max_overlap);
-    let search_region =
-        crop_imm(&current_map, 0, 0, current_map.width(), max_overlap).to_image();
     let mut primary_candidates: Vec<MatchCandidate> = template_heights
         .par_iter()
         .copied()
         .filter_map(|template_height| {
-            let template = crop_imm(
+            match_overlap_candidate(
                 &previous_map,
-                0,
-                previous_map.height().checked_sub(template_height)?,
-                previous_map.width(),
+                &current_map,
                 template_height,
+                min_overlap,
+                max_overlap,
             )
-            .to_image();
-            let response = match_template(
-                &search_region,
-                &template,
-                MatchTemplateMethod::CrossCorrelationNormalized,
-            );
-            let extremes = find_extremes(&response);
-            let best_y = extremes.max_value_location.1;
-            let (refined_y, refined_score) = refine_template_match(&response, best_y);
-            let refined_overlap = refined_y.round() as u32 + template_height;
-            if !(min_overlap..=max_overlap).contains(&refined_overlap) {
-                return None;
-            }
-            Some(MatchCandidate {
-                overlap: refined_overlap,
-                score: refined_score,
-                alternative_score: best_alternative_score(&response, best_y),
-                template_height,
-            })
         })
         .collect();
-
-    if let Some(ms) = match_overlap_candidate_multiscale(
-        &previous_map,
-        &current_map,
-        min_overlap,
-        max_overlap,
-    ) {
-        primary_candidates.push(ms);
-    }
 
     primary_candidates.sort_by(|a, b| {
         b.score
@@ -203,56 +157,23 @@ fn detect_overlap_inner(
 
     let best = *primary_candidates.first()?;
 
-    if !sse_validate(
-        &previous_map,
-        &current_map,
-        best.template_height,
-        best.overlap,
-    ) {
-        return None;
-    }
-
-    if best.score < score_threshold {
+    if best.score < MATCH_SCORE_THRESHOLD {
         return None;
     }
 
     let local_margin_ok = best.alternative_score.is_nan()
-        || (best.score - best.alternative_score) >= local_delta;
+        || (best.score - best.alternative_score) >= LOCAL_CONFIDENCE_DELTA;
     if !local_margin_ok {
         return None;
     }
 
-    let global_alternative = primary_candidates
+    if let Some(other) = primary_candidates
         .iter()
         .skip(1)
-        .find(|candidate| candidate.overlap.abs_diff(best.overlap) >= ALTERNATIVE_GAP);
-    if let Some(other) = global_alternative {
-        let global_margin_ok = (best.score - other.score) >= global_delta;
-        if !global_margin_ok {
-            return None;
-        }
-    }
-
-    let vote_bands = candidate_vote_bands(previous_map.width());
-    let support_votes = ranked_overlap_votes(
-        &previous_map,
-        &current_map,
-        &template_heights,
-        &vote_bands,
-        min_overlap,
-        max_overlap,
-    );
-    if let Some(top_vote) = support_votes.first()
-        && top_vote.votes >= 2
-        && top_vote.overlap.abs_diff(best.overlap) > OVERLAP_VOTE_TOLERANCE
+        .find(|candidate| candidate.overlap.abs_diff(best.overlap) >= ALTERNATIVE_GAP)
+        && (best.score - other.score) < GLOBAL_CONFIDENCE_DELTA
     {
-        let runner_up_supports_primary = support_votes
-            .iter()
-            .skip(1)
-            .any(|vote| vote.overlap.abs_diff(best.overlap) <= OVERLAP_VOTE_TOLERANCE);
-        if !runner_up_supports_primary {
-            return None;
-        }
+        return None;
     }
 
     let pixel_diff = sampled_difference(
@@ -321,151 +242,6 @@ fn candidate_template_heights(min_overlap: u32, max_overlap: u32) -> Vec<u32> {
     heights.sort_unstable();
     heights
 }
-
-fn match_overlap_candidate_multiscale(
-    previous: &GrayImage,
-    current: &GrayImage,
-    min_overlap: u32,
-    max_overlap: u32,
-) -> Option<MatchCandidate> {
-    let w = previous.width() / 2;
-    let h = previous.height() / 2;
-    if w < 20 || h < 20 {
-        return None;
-    }
-
-    let prev_small = imageops::resize(previous, w, h, imageops::FilterType::Triangle);
-    let curr_small = imageops::resize(current, w, h, imageops::FilterType::Triangle);
-
-    let min_small = (min_overlap / 2).max(MIN_TEMPLATE_HEIGHT);
-    let max_small = (max_overlap / 2 + 1).min(h.saturating_sub(1));
-    if min_small > max_small {
-        return None;
-    }
-
-    let heights = candidate_template_heights(min_small, max_small);
-    let best_small = heights
-        .iter()
-        .copied()
-        .filter_map(|th| {
-            match_overlap_candidate(&prev_small, &curr_small, th, min_small, max_small)
-        })
-        .max_by(|a, b| a.score.total_cmp(&b.score))?;
-
-    if best_small.score < 0.70 {
-        return None;
-    }
-
-    let estimate = best_small.overlap.saturating_mul(2);
-    let refine_min = estimate.saturating_sub(4).max(min_overlap);
-    let refine_max = (estimate + 4).min(max_overlap);
-    if refine_min > refine_max {
-        return None;
-    }
-
-    let refine_heights = candidate_template_heights(refine_min, refine_max);
-    refine_heights
-        .iter()
-        .copied()
-        .filter_map(|th| {
-            match_overlap_candidate(previous, current, th, refine_min, refine_max)
-        })
-        .max_by(|a, b| a.score.total_cmp(&b.score))
-}
-
-fn candidate_vote_bands(width: u32) -> Vec<HorizontalBand> {
-    let mut bands = Vec::new();
-    if width < MIN_VOTE_WINDOW_WIDTH {
-        return bands;
-    }
-
-    let band_count = 5u32.min(width / MIN_VOTE_WINDOW_WIDTH).max(1);
-    let base_band_width = width / band_count;
-
-    for i in 0..band_count {
-        let left = i * base_band_width;
-        let right = if i == band_count - 1 {
-            width
-        } else {
-            (i + 1) * base_band_width
-        };
-        if right.saturating_sub(left) >= MIN_VOTE_WINDOW_WIDTH {
-            bands.push(HorizontalBand { left, right });
-        }
-    }
-
-    bands
-}
-
-fn ranked_overlap_votes(
-    previous: &GrayImage,
-    current: &GrayImage,
-    template_heights: &[u32],
-    vote_bands: &[HorizontalBand],
-    min_overlap: u32,
-    max_overlap: u32,
-) -> Vec<OverlapVote> {
-    let mut candidates: Vec<MatchCandidate> = vote_bands
-        .par_iter()
-        .copied()
-        .flat_map_iter(|band| {
-            let prev_band = crop_gray_to_band(previous, Some(band));
-            let curr_band = crop_gray_to_band(current, Some(band));
-            let results: Vec<MatchCandidate> = template_heights
-                .iter()
-                .copied()
-                .filter_map(|th| {
-                    match_overlap_candidate(&prev_band, &curr_band, th, min_overlap, max_overlap)
-                })
-                .collect();
-            results.into_iter()
-        })
-        .collect();
-
-    candidates.sort_by(|a, b| a.overlap.cmp(&b.overlap).then_with(|| b.score.total_cmp(&a.score)));
-    let mut votes = Vec::new();
-    let mut cluster_start = 0usize;
-
-    while cluster_start < candidates.len() {
-        let mut cluster_end = cluster_start + 1;
-        let anchor_overlap = candidates[cluster_start].overlap;
-        while cluster_end < candidates.len()
-            && candidates[cluster_end].overlap.abs_diff(anchor_overlap) <= OVERLAP_VOTE_TOLERANCE
-        {
-            cluster_end += 1;
-        }
-
-        let cluster = &candidates[cluster_start..cluster_end];
-        let representative = cluster
-            .iter()
-            .max_by(|a, b| {
-                a.score
-                    .total_cmp(&b.score)
-                    .then_with(|| a.template_height.cmp(&b.template_height))
-            })
-            .copied()
-            .expect("cluster is non-empty");
-        let average_score =
-            cluster.iter().map(|candidate| candidate.score).sum::<f32>() / cluster.len() as f32;
-
-        votes.push(OverlapVote {
-            overlap: representative.overlap,
-            votes: cluster.len(),
-            best_score: representative.score,
-            average_score,
-        });
-        cluster_start = cluster_end;
-    }
-
-    votes.sort_by(|a, b| {
-        b.votes
-            .cmp(&a.votes)
-            .then_with(|| b.average_score.total_cmp(&a.average_score))
-            .then_with(|| b.best_score.total_cmp(&a.best_score))
-    });
-    votes
-}
-
 fn match_overlap_candidate(
     previous: &GrayImage,
     current: &GrayImage,
@@ -505,37 +281,6 @@ fn match_overlap_candidate(
     })
 }
 
-fn sse_validate(
-    previous: &GrayImage,
-    current: &GrayImage,
-    template_height: u32,
-    ncc_overlap: u32,
-) -> bool {
-    let Some(template) = (template_height <= previous.height() && template_height <= ncc_overlap).then(|| {
-        crop_imm(
-            previous,
-            0,
-            previous.height() - template_height,
-            previous.width(),
-            template_height,
-        )
-        .to_image()
-    }) else {
-        return true;
-    };
-    let ncc_pos_in_search = ncc_overlap - template_height;
-    let search_region = crop_imm(current, 0, 0, current.width(), ncc_overlap).to_image();
-
-    let response = match_template(
-        &search_region,
-        &template,
-        MatchTemplateMethod::SumOfSquaredErrorsNormalized,
-    );
-    let sse_value = response.get_pixel(0, ncc_pos_in_search)[0].clamp(0.0, 1.0);
-    let sse_similarity = 1.0 - sse_value;
-
-    sse_similarity >= SSE_VALIDATE_THRESHOLD
-}
 
 fn refine_template_match(
     response: &imageproc::definitions::Image<image::Luma<f32>>,
@@ -549,41 +294,31 @@ fn refine_template_match(
     let s1 = response.get_pixel(0, best_y)[0];
     let s2 = response.get_pixel(0, best_y + 1)[0];
 
-    let a = (s0 + s2 - 2.0 * s1) / 2.0;
-    let b = (s2 - s0) / 2.0;
-
-    if a >= -0.0001 {
-        return (best_y as f32, s1);
-    }
-
-    let peak_shift = (-b / (2.0 * a)).clamp(-1.0, 1.0);
-    let peak_y = best_y as f32 + peak_shift;
-    let peak_score = a * peak_shift * peak_shift + b * peak_shift + s1;
-
-    (peak_y, peak_score)
+    let peak_score = s0.max(s1).max(s2);
+    (best_y as f32, peak_score)
 }
 
 fn best_alternative_score(
     response: &imageproc::definitions::Image<image::Luma<f32>>,
     best_y: u32,
 ) -> f32 {
-    response
-        .enumerate_pixels()
-        .filter(|(x, y, _)| *x == 0 && y.abs_diff(best_y) >= ALTERNATIVE_GAP)
-        .map(|(_, _, pixel)| pixel[0])
+    (0..response.height())
+        .filter(|y| y.abs_diff(best_y) >= ALTERNATIVE_GAP)
+        .filter_map(|y| {
+            let v = response.get_pixel(0, y)[0];
+            v.is_finite().then_some(v)
+        })
         .max_by(|a, b| a.total_cmp(b))
         .unwrap_or(f32::NAN)
 }
 
-fn to_feature_map_from_gray(grayscale: &GrayImage, band: Option<HorizontalBand>) -> (GrayImage, bool, f32) {
+fn to_feature_map_from_gray(grayscale: &GrayImage, band: Option<HorizontalBand>) -> (GrayImage, bool) {
     let grayscale = crop_gray_to_band(grayscale, band);
     let gradients = sobel_gradients(&grayscale);
 
-    let mut stats = Variance::new();
     let mut max_gradient = 0u16;
     for p in gradients.pixels() {
         let v = p[0];
-        stats.add(v as f64);
         if v > max_gradient {
             max_gradient = v;
         }
@@ -591,13 +326,16 @@ fn to_feature_map_from_gray(grayscale: &GrayImage, band: Option<HorizontalBand>)
 
     if max_gradient == 0 {
         let blank = GrayImage::new(grayscale.width(), grayscale.height());
-        return (blank, false, 0.0);
+        return (blank, false);
     }
 
+    let mut stats = Variance::new();
+    for p in gradients.pixels() {
+        stats.add(p[0] as f64);
+    }
     let mean = stats.mean() as f32;
     let stddev = stats.sample_variance().sqrt() as f32;
     let normalizer = (mean + 3.0 * stddev).max(1.0);
-    let texture_energy = mean / normalizer;
 
     (
         GrayImage::from_fn(gradients.width(), gradients.height(), |x, y| {
@@ -606,7 +344,6 @@ fn to_feature_map_from_gray(grayscale: &GrayImage, band: Option<HorizontalBand>)
             Luma([scaled.round().clamp(0.0, 255.0) as u8])
         }),
         true,
-        texture_energy,
     )
 }
 
@@ -1009,29 +746,6 @@ mod tests {
             }
         }
         image
-    }
-
-    // ── candidate_vote_bands ────────────────────────────────
-
-    #[test]
-    fn vote_bands_partition_width_exactly_min_width() {
-        let bands = super::candidate_vote_bands(64);
-        assert_eq!(bands.len(), 1, "single band for width == MIN_VOTE_WINDOW_WIDTH");
-        assert!(bands[0].width() >= 64);
-    }
-
-    #[test]
-    fn vote_bands_partition_non_overlapping() {
-        let bands = super::candidate_vote_bands(500);
-        assert!(bands.len() >= 3, "should partition wide images into 3+ bands");
-        for w in bands.windows(2) {
-            assert!(w[0].right <= w[1].left, "bands must not overlap");
-        }
-    }
-
-    #[test]
-    fn vote_bands_return_empty_for_narrow_width() {
-        assert!(super::candidate_vote_bands(47).is_empty());
     }
 
     // ── Scrollbar exclusion ─────────────────────────────────
