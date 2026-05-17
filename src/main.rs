@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::region::select_capture_region;
 use crate::scroll::ScrollController;
 use crate::stitch::{
-    detect_vertical_overlap, frames_are_similar, stitch_vertical,
+    detect_vertical_overlap, frames_are_similar, overlap_region_diff, stitch_vertical, IDENTICAL_THRESHOLD,
 };
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
@@ -86,23 +86,24 @@ fn run() -> AppResult<()> {
             overlaps.push(overlap);
             measured_overlaps.push(overlap);
             frames.push(next);
+        } else if let Some(overlap) = estimate_overlap_from_history(&measured_overlaps, next.height()) {
+            // Verify the estimate: the overlapping region should match.
+            // If it doesn't (diff > threshold), content stopped advancing.
+            if overlap_region_diff(previous, &next, overlap) > IDENTICAL_THRESHOLD * 5.0 {
+                eprintln!("info: reached page bottom");
+                break;
+            }
+            eprintln!(
+                "info: continuing with estimated overlap {} from history ({} prior frames)",
+                overlap,
+                measured_overlaps.len()
+            );
+            overlaps.push(overlap);
+            frames.push(next);
+            continue;
+        } else if frames.len() == 1 {
+            return Err(AppError::OverlapNotFound);
         } else {
-
-            if let Some(overlap) = estimate_overlap_from_history(&measured_overlaps, next.height()) {
-                eprintln!(
-                    "info: continuing with estimated overlap {} from history ({} prior frames)",
-                    overlap,
-                    measured_overlaps.len()
-                );
-                overlaps.push(overlap);
-                frames.push(next);
-                continue;
-            }
-
-            if frames.len() == 1 {
-                return Err(AppError::OverlapNotFound);
-            }
-
             eprintln!(
                 "warning: overlap detection became unreliable after {} frame(s); saving the captured portion",
                 frames.len()

@@ -11,7 +11,7 @@ use rayon::prelude::*;
 use crate::error::{AppError, AppResult};
 
 const SAMPLE_STEP: u32 = 4;
-const IDENTICAL_THRESHOLD: f32 = 1.5;
+pub(crate) const IDENTICAL_THRESHOLD: f32 = 1.5;
 const MIN_OVERLAP_RATIO: f32 = 0.02;
 const MAX_OVERLAP_RATIO: f32 = 0.995;
 const MIN_TEMPLATE_HEIGHT: u32 = 8;
@@ -77,6 +77,22 @@ pub fn frames_are_similar(previous: &RgbaImage, current: &RgbaImage) -> bool {
         SAMPLE_STEP * 2,
         None,
     ) <= IDENTICAL_THRESHOLD
+}
+
+/// Returns the mean pixel difference in the overlapping region defined by
+/// `estimated_overlap` (the bottom `overlap` rows of `previous` vs. the top
+/// `overlap` rows of `current`). A high value indicates the estimate is
+/// incorrect, e.g. when the page has stopped scrolling.
+pub fn overlap_region_diff(previous: &RgbaImage, current: &RgbaImage, overlap: u32) -> f32 {
+    sampled_difference(
+        previous,
+        current,
+        previous.height() - overlap,
+        0,
+        overlap,
+        SAMPLE_STEP * 2,
+        None,
+    )
 }
 
 pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
