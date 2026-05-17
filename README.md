@@ -12,15 +12,19 @@ Scrollshot is a CLI tool that lets you capture a scrolling (long) screenshot on 
 2. **Auto-scroll & capture** — Scrollshot sends simulated mouse wheel events at the chosen point, captures each frame via `xcap` (or GDI fallback), and detects overlaps between consecutive frames using computer vision (gradient-based template matching with text body band detection).
 3. **Stitch** — overlapping regions are removed and frames are assembled into one continuous image.
 
-## Build
+## Install
+
+```bash
+cargo install --git https://github.com/xutianyi1999/scrollshot
+```
+
+Or build from source:
 
 ```bash
 git clone https://github.com/xutianyi1999/scrollshot
 cd scrollshot
-cargo build --release
+cargo install --path .
 ```
-
-The binary will be at `target/release/scrollshot.exe`.
 
 ## Usage
 

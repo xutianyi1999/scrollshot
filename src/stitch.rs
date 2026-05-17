@@ -6,6 +6,7 @@ use imageproc::stats::histogram;
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template};
 
 use average::{Estimate, Variance};
+use rayon::prelude::*;
 
 use crate::error::{AppError, AppResult};
 
@@ -105,7 +106,7 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         left: 0,
         right: scrollbar_safe_right,
     });
-    let focus_band = shared_text_body_band(&previous_gray, &current_gray)
+    let focus_band = detect_text_body_band(&previous_gray)
         .map(|band| {
             let right = band.right.min(scrollbar_safe_right);
             HorizontalBand {
@@ -136,19 +137,40 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
     };
 
     let template_heights = candidate_template_heights(min_overlap, max_overlap);
-    let mut primary_candidates = template_heights
-        .iter()
+    let search_region =
+        crop_imm(&current_map, 0, 0, current_map.width(), max_overlap).to_image();
+    let mut primary_candidates: Vec<MatchCandidate> = template_heights
+        .par_iter()
         .copied()
         .filter_map(|template_height| {
-            match_overlap_candidate(
+            let template = crop_imm(
                 &previous_map,
-                &current_map,
+                0,
+                previous_map.height().checked_sub(template_height)?,
+                previous_map.width(),
                 template_height,
-                min_overlap,
-                max_overlap,
             )
+            .to_image();
+            let response = match_template(
+                &search_region,
+                &template,
+                MatchTemplateMethod::CrossCorrelationNormalized,
+            );
+            let extremes = find_extremes(&response);
+            let best_y = extremes.max_value_location.1;
+            let (refined_y, refined_score) = refine_template_match(&response, best_y);
+            let refined_overlap = refined_y.round() as u32 + template_height;
+            if !(min_overlap..=max_overlap).contains(&refined_overlap) {
+                return None;
+            }
+            Some(MatchCandidate {
+                overlap: refined_overlap,
+                score: refined_score,
+                alternative_score: best_alternative_score(&response, best_y),
+                template_height,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     if let Some(ms) = match_overlap_candidate_multiscale(
         &previous_map,
@@ -195,10 +217,6 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         if !global_margin_ok {
             return None;
         }
-    }
-
-    if best.score >= 0.99 {
-        return Some(best.overlap);
     }
 
     let vote_bands = candidate_vote_bands(previous_map.width());
@@ -354,22 +372,22 @@ fn ranked_overlap_votes(
     min_overlap: u32,
     max_overlap: u32,
 ) -> Vec<OverlapVote> {
-    let mut candidates = Vec::new();
-    for band in vote_bands.iter().copied() {
-        let prev_band = crop_gray_to_band(previous, Some(band));
-        let curr_band = crop_gray_to_band(current, Some(band));
-        for template_height in template_heights.iter().copied() {
-            if let Some(candidate) = match_overlap_candidate(
-                &prev_band,
-                &curr_band,
-                template_height,
-                min_overlap,
-                max_overlap,
-            ) {
-                candidates.push(candidate);
-            }
-        }
-    }
+    let mut candidates: Vec<MatchCandidate> = vote_bands
+        .par_iter()
+        .copied()
+        .flat_map_iter(|band| {
+            let prev_band = crop_gray_to_band(previous, Some(band));
+            let curr_band = crop_gray_to_band(current, Some(band));
+            let results: Vec<MatchCandidate> = template_heights
+                .iter()
+                .copied()
+                .filter_map(|th| {
+                    match_overlap_candidate(&prev_band, &curr_band, th, min_overlap, max_overlap)
+                })
+                .collect();
+            results.into_iter()
+        })
+        .collect();
 
     candidates.sort_by(|a, b| a.overlap.cmp(&b.overlap).then_with(|| b.score.total_cmp(&a.score)));
     let mut votes = Vec::new();
@@ -524,11 +542,6 @@ fn best_alternative_score(
         .unwrap_or(f32::NAN)
 }
 
-fn mean_and_stddev(values: &[f32]) -> (f32, f32) {
-    let stats: Variance = values.iter().map(|v| *v as f64).collect();
-    (stats.mean() as f32, stats.sample_variance().sqrt() as f32)
-}
-
 fn to_feature_map_from_gray(grayscale: &GrayImage, band: Option<HorizontalBand>) -> (GrayImage, bool, f32) {
     let grayscale = crop_gray_to_band(grayscale, band);
     let gradients = sobel_gradients(&grayscale);
@@ -586,7 +599,12 @@ fn sampled_difference(
         for x in (band.left..band.right).step_by(step as usize) {
             let a = previous.get_pixel(x, py).0;
             let b = current.get_pixel(x, cy).0;
-            total += pixel_difference(a, b);
+            total += a.iter()
+                .zip(b.iter())
+                .take(3)
+                .map(|(x, y)| (*x as f32 - *y as f32).abs())
+                .sum::<f32>()
+                / 3.0;
             count += 1;
         }
     }
@@ -626,7 +644,8 @@ fn detect_text_body_band(image: &GrayImage) -> Option<HorizontalBand> {
         row_ink.push(count as f32 / focus_binary.width() as f32);
     }
 
-    let (_, row_stddev) = mean_and_stddev(&row_ink);
+    let row_stats: Variance = row_ink.iter().map(|v| *v as f64).collect();
+    let row_stddev = row_stats.sample_variance().sqrt() as f32;
     if row_stddev < TEXT_PAGE_MIN_ROW_VARIATION {
         return None;
     }
@@ -663,10 +682,6 @@ fn normalized_band(band: Option<HorizontalBand>, width: u32) -> Option<Horizonta
     let left = band.left.min(width);
     let right = band.right.min(width);
     (left < right).then_some(HorizontalBand { left, right })
-}
-
-fn shared_text_body_band(gray: &GrayImage, _: &GrayImage) -> Option<HorizontalBand> {
-    detect_text_body_band(gray)
 }
 
 fn detect_body_band(binary: &GrayImage) -> Option<HorizontalBand> {
@@ -707,7 +722,7 @@ fn detect_body_band(binary: &GrayImage) -> Option<HorizontalBand> {
     }
 
     let active_threshold = (peak * TEXT_BODY_ACTIVE_RATIO).max(TEXT_BODY_MIN_DENSITY);
-    let min_width = minimum_body_band_width(width);
+    let min_width = ((width as f32) * TEXT_BODY_MIN_WIDTH_RATIO).round() as u32;
     let preferred_center = width as f32 / 2.0;
     let mut best_band = None;
     let mut best_score = f32::MIN;
@@ -740,10 +755,6 @@ fn detect_body_band(binary: &GrayImage) -> Option<HorizontalBand> {
     (left < right).then_some(HorizontalBand { left, right })
 }
 
-fn minimum_body_band_width(width: u32) -> u32 {
-    ((width as f32) * TEXT_BODY_MIN_WIDTH_RATIO).round() as u32
-}
-
 fn smooth_density(values: &[f32], radius: usize) -> Vec<f32> {
     let n = values.len();
     if n == 0 {
@@ -772,18 +783,9 @@ fn score_body_band(
     mass * (1.0 - center_distance * 0.2)
 }
 
-fn pixel_difference(a: [u8; 4], b: [u8; 4]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .take(3)
-        .map(|(x, y)| (*x as f32 - *y as f32).abs())
-        .sum::<f32>()
-        / 3.0
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{detect_vertical_overlap, frames_are_similar, shared_text_body_band, stitch_vertical};
+    use super::{detect_text_body_band, detect_vertical_overlap, frames_are_similar, stitch_vertical};
     use image::imageops::{self, crop_imm};
     use image::{Rgba, RgbaImage};
 
@@ -872,10 +874,8 @@ mod tests {
     fn text_body_band_focuses_on_the_main_document_column() {
         let source = build_sidebar_document_source(120, 220);
         let first = crop(&source, 0, 120);
-        let second = crop(&source, 24, 120);
         let first_gray = imageops::grayscale(&first);
-        let second_gray = imageops::grayscale(&second);
-        let band = shared_text_body_band(&first_gray, &second_gray).unwrap();
+        let band = detect_text_body_band(&first_gray).unwrap();
 
         assert!(band.left >= 20);
         assert!(band.width() < first.width());
@@ -1030,10 +1030,8 @@ mod tests {
     fn scrollbar_margin_excludes_right_region() {
         let src = build_scrollbar_source(120, 160);
         let first = crop(&src, 0, 80);
-        let second = crop(&src, 12, 80);
         let first_gray = imageops::grayscale(&first);
-        let second_gray = imageops::grayscale(&second);
-        let band = super::shared_text_body_band(&first_gray, &second_gray);
+        let band = super::detect_text_body_band(&first_gray);
         assert!(band.is_some(), "text body band should be detected");
         if let Some(b) = band {
             assert!(b.right < 115, "scrollbar margin should exclude right ~1.2%");
@@ -1146,9 +1144,9 @@ mod tests {
     // ── Text body band ──────────────────────────────────────
 
     #[test]
-    fn shared_text_body_band_returns_none_for_uniform() {
+    fn detect_text_body_band_returns_none_for_uniform() {
         let uniform = RgbaImage::from_pixel(64, 64, Rgba([255, 255, 255, 255]));
         let gray = imageops::grayscale(&uniform);
-        assert!(shared_text_body_band(&gray, &gray).is_none());
+        assert!(detect_text_body_band(&gray).is_none());
     }
 }
