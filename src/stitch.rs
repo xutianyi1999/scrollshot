@@ -494,7 +494,7 @@ fn sse_validate(
     template_height: u32,
     ncc_overlap: u32,
 ) -> bool {
-    let Some(template) = (template_height <= previous.height()).then(|| {
+    let Some(template) = (template_height <= previous.height() && template_height <= ncc_overlap).then(|| {
         crop_imm(
             previous,
             0,
@@ -506,7 +506,7 @@ fn sse_validate(
     }) else {
         return true;
     };
-    let ncc_pos_in_search = ncc_overlap.saturating_sub(template_height);
+    let ncc_pos_in_search = ncc_overlap - template_height;
     let search_region = crop_imm(current, 0, 0, current.width(), ncc_overlap).to_image();
 
     let response = match_template(
