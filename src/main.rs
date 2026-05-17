@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::region::select_capture_region;
 use crate::scroll::ScrollController;
 use crate::stitch::{
-    detect_overlap_relaxed, detect_vertical_overlap, frames_are_similar, stitch_vertical,
+    detect_vertical_overlap, frames_are_similar, stitch_vertical,
 };
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
@@ -26,11 +26,6 @@ use windows::Win32::UI::HiDpi::{
 };
 
 const MAX_STAGNANT_SCROLLS: usize = 3;
-const NOTCH_REDUCTION_ON_MISS: i32 = 1;
-const SETTLE_INCREMENT_MS: u64 = 50;
-const MAX_SETTLE_MS: u64 = 1000;
-const SUCCESSFUL_STEPS_BEFORE_RESTORE: usize = 3;
-const MAX_CONSECUTIVE_MISSES_AT_MIN_NOTCH: usize = 3;
 const ESC_POLL_INTERVAL_MS: u64 = 25;
 const OVERLAP_MISS_RETRY_MS: u64 = 80;
 const MAX_SAME_POSITION_RECOVERIES: usize = 2;
@@ -57,11 +52,8 @@ fn run() -> AppResult<()> {
 
     let mut frames = Vec::with_capacity(cli.max_scrolls.saturating_add(1));
     let mut overlaps = Vec::with_capacity(cli.max_scrolls);
+    let mut measured_overlaps = Vec::with_capacity(cli.max_scrolls);
     let mut stagnant_scrolls = 0usize;
-    let mut current_notches = cli.wheel_notches;
-    let mut current_settle_ms = cli.settle_ms;
-    let mut consecutive_misses_at_min = 0usize;
-    let mut successful_steps = 0usize;
     let mut retry_same_position = false;
     let mut same_position_recoveries = 0usize;
 
@@ -80,8 +72,8 @@ fn run() -> AppResult<()> {
                 break;
             }
         } else {
-            scroller.scroll_down_once(selection.scroll_point, current_notches)?;
-            if wait_for_scroll_settle_or_escape(current_settle_ms) {
+            scroller.scroll_down_once(selection.scroll_point, cli.wheel_notches)?;
+            if wait_for_scroll_settle_or_escape(cli.settle_ms) {
                 eprintln!("stopped early by Esc; saving the captured portion");
                 break;
             }
@@ -128,75 +120,19 @@ fn run() -> AppResult<()> {
         if let Some(overlap) = overlap {
             retry_same_position = false;
             same_position_recoveries = 0;
-            consecutive_misses_at_min = 0;
-            successful_steps += 1;
-            if successful_steps >= SUCCESSFUL_STEPS_BEFORE_RESTORE {
-                let restored = current_notches < cli.wheel_notches;
-                let settled = current_settle_ms > cli.settle_ms;
-                if restored {
-                    current_notches =
-                        (current_notches + NOTCH_REDUCTION_ON_MISS).min(cli.wheel_notches);
-                }
-                if settled {
-                    current_settle_ms = current_settle_ms
-                        .saturating_sub(SETTLE_INCREMENT_MS)
-                        .max(cli.settle_ms);
-                }
-                if restored || settled {
-                    successful_steps = 0;
-                }
-            }
             overlaps.push(overlap);
+            measured_overlaps.push(overlap);
             frames.push(next);
         } else {
             retry_same_position = false;
             same_position_recoveries = 0;
-            successful_steps = 0;
 
-            if current_notches > 1 {
-                current_notches = (current_notches - NOTCH_REDUCTION_ON_MISS).max(1);
-                current_settle_ms = (current_settle_ms + SETTLE_INCREMENT_MS).min(MAX_SETTLE_MS);
-                eprintln!(
-                    "info: reduced scroll step to {} notch(es), settle {} ms",
-                    current_notches, current_settle_ms
-                );
-                continue;
-            }
-
-            consecutive_misses_at_min += 1;
-            current_settle_ms = (current_settle_ms + SETTLE_INCREMENT_MS).min(MAX_SETTLE_MS);
-            if consecutive_misses_at_min < MAX_CONSECUTIVE_MISSES_AT_MIN_NOTCH {
-                eprintln!(
-                    "info: increased settle to {} ms for better overlap",
-                    current_settle_ms
-                );
-                continue;
-            }
-
-            if let Some(overlap) = detect_overlap_relaxed(previous, &next) {
-                eprintln!(
-                    "info: recovered with relaxed matching at overlap {}",
-                    overlap
-                );
-                retry_same_position = false;
-                same_position_recoveries = 0;
-                consecutive_misses_at_min = 0;
-                successful_steps = 0;
-                overlaps.push(overlap);
-                frames.push(next);
-                continue;
-            }
-
-            if let Some(overlap) = estimate_overlap_from_history(&overlaps, next.height()) {
+            if let Some(overlap) = estimate_overlap_from_history(&measured_overlaps, next.height()) {
                 eprintln!(
                     "info: continuing with estimated overlap {} from history ({} prior frames)",
                     overlap,
-                    overlaps.len()
+                    measured_overlaps.len()
                 );
-                retry_same_position = false;
-                same_position_recoveries = 0;
-                consecutive_misses_at_min = 0;
-                successful_steps = 0;
                 overlaps.push(overlap);
                 frames.push(next);
                 continue;
@@ -279,12 +215,11 @@ fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_CONSECUTIVE_MISSES_AT_MIN_NOTCH, MAX_SAME_POSITION_RECOVERIES, MAX_STAGNANT_SCROLLS};
+    use super::{MAX_SAME_POSITION_RECOVERIES, MAX_STAGNANT_SCROLLS};
 
     #[test]
     fn stop_thresholds_allow_short_retries() {
         assert!(MAX_STAGNANT_SCROLLS > 1);
-        assert!(MAX_CONSECUTIVE_MISSES_AT_MIN_NOTCH > 1);
         assert!(MAX_SAME_POSITION_RECOVERIES > 1);
     }
 }

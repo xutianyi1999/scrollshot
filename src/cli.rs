@@ -18,7 +18,7 @@ pub struct Cli {
     pub max_scrolls: usize,
 
     /// Delay after each downward wheel scroll, in milliseconds.
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 200)]
     pub settle_ms: u64,
 
     /// Number of downward wheel notches to send per step.

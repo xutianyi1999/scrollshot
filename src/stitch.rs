@@ -73,14 +73,10 @@ pub fn frames_are_similar(previous: &RgbaImage, current: &RgbaImage) -> bool {
 }
 
 pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
-    detect_overlap_inner(previous, current, false)
+    detect_overlap_inner(previous, current)
 }
 
-pub fn detect_overlap_relaxed(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
-    detect_overlap_inner(previous, current, true)
-}
-
-fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage, relaxed: bool) -> Option<u32> {
+fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
     if previous.width() != current.width() || previous.height() != current.height() {
         return None;
     }
@@ -99,10 +95,7 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage, relaxed: bool
     let (previous_map, current_map) = overlap_match_maps(previous, current, focus_band);
 
     let texture_energy = estimate_texture_energy(&previous_map);
-    let (score_threshold, local_delta, global_delta) = if relaxed {
-        let score = 0.82 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.82);
-        (score, LOCAL_CONFIDENCE_DELTA, GLOBAL_CONFIDENCE_DELTA)
-    } else {
+    let (score_threshold, local_delta, global_delta) = {
         let score = 0.86 + texture_energy * (MATCH_SCORE_THRESHOLD - 0.86);
         let local = 0.003 + texture_energy * (LOCAL_CONFIDENCE_DELTA - 0.003);
         let global = 0.001 + texture_energy * (GLOBAL_CONFIDENCE_DELTA - 0.001);
@@ -125,15 +118,13 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage, relaxed: bool
         })
         .collect::<Vec<_>>();
 
-    if !relaxed {
-        if let Some(ms) = match_overlap_candidate_multiscale(
-            &previous_map,
-            &current_map,
-            min_overlap,
-            max_overlap,
-        ) {
-            primary_candidates.push(ms);
-        }
+    if let Some(ms) = match_overlap_candidate_multiscale(
+        &previous_map,
+        &current_map,
+        min_overlap,
+        max_overlap,
+    ) {
+        primary_candidates.push(ms);
     }
 
     primary_candidates.sort_by(|a, b| {
@@ -823,7 +814,7 @@ fn pixel_difference(a: [u8; 4], b: [u8; 4]) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_overlap_relaxed, detect_vertical_overlap, frames_are_similar, shared_text_body_band, stitch_vertical};
+    use super::{detect_vertical_overlap, frames_are_similar, shared_text_body_band, stitch_vertical};
     use image::imageops::crop_imm;
     use image::{Rgba, RgbaImage};
 
@@ -1062,17 +1053,6 @@ mod tests {
         let first = crop(&source, 0, 100);
         let second = crop(&source, 10, 100);
         assert_eq!(detect_vertical_overlap(&first, &second), Some(90));
-    }
-
-    #[test]
-    fn detect_overlap_relaxed_matches_normal_for_clean_content() {
-        let source = build_source(48, 140);
-        let first = crop(&source, 0, 60);
-        let second = crop(&source, 23, 60);
-        assert_eq!(
-            detect_vertical_overlap(&first, &second),
-            detect_overlap_relaxed(&first, &second),
-        );
     }
 
     #[test]
