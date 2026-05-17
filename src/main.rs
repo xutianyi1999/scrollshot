@@ -27,8 +27,6 @@ use windows::Win32::UI::HiDpi::{
 
 const MAX_STAGNANT_SCROLLS: usize = 3;
 const ESC_POLL_INTERVAL_MS: u64 = 25;
-const OVERLAP_MISS_RETRY_MS: u64 = 80;
-const MAX_SAME_POSITION_RECOVERIES: usize = 2;
 
 fn main() {
     if let Err(error) = run() {
@@ -54,8 +52,6 @@ fn run() -> AppResult<()> {
     let mut overlaps = Vec::with_capacity(cli.max_scrolls);
     let mut measured_overlaps = Vec::with_capacity(cli.max_scrolls);
     let mut stagnant_scrolls = 0usize;
-    let mut retry_same_position = false;
-    let mut same_position_recoveries = 0usize;
 
     let first = capture.capture()?;
     frames.push(first);
@@ -66,26 +62,17 @@ fn run() -> AppResult<()> {
             break;
         }
 
-        if retry_same_position {
-            if wait_for_scroll_settle_or_escape(OVERLAP_MISS_RETRY_MS) {
-                eprintln!("stopped early by Esc; saving the captured portion");
-                break;
-            }
-        } else {
-            scroller.scroll_down_once(selection.scroll_point, cli.wheel_notches)?;
-            if wait_for_scroll_settle_or_escape(cli.settle_ms) {
-                eprintln!("stopped early by Esc; saving the captured portion");
-                break;
-            }
+        scroller.scroll_down_once(selection.scroll_point, cli.wheel_notches)?;
+        if wait_for_scroll_settle_or_escape(cli.settle_ms) {
+            eprintln!("stopped early by Esc; saving the captured portion");
+            break;
         }
-        let mut next = capture.capture()?;
+        let next = capture.capture()?;
         let previous = frames.last().expect("at least one frame exists");
 
         validate_frame_dimensions(previous, &next)?;
 
         if frames_are_similar(previous, &next) {
-            retry_same_position = false;
-            same_position_recoveries = 0;
             stagnant_scrolls += 1;
             if stagnant_scrolls >= MAX_STAGNANT_SCROLLS {
                 break;
@@ -94,38 +81,11 @@ fn run() -> AppResult<()> {
         }
         stagnant_scrolls = 0;
 
-        let mut overlap = detect_vertical_overlap(previous, &next);
-        if overlap.is_none() {
-            if wait_for_scroll_settle_or_escape(OVERLAP_MISS_RETRY_MS) {
-                eprintln!("stopped early by Esc; saving the captured portion");
-                break;
-            }
-
-            let retry = capture.capture()?;
-            validate_frame_dimensions(previous, &retry)?;
-            if !frames_are_similar(previous, &retry) {
-                overlap = detect_vertical_overlap(previous, &retry);
-                if overlap.is_some() {
-                    next = retry;
-                } else if !frames_are_similar(&next, &retry)
-                    && same_position_recoveries < MAX_SAME_POSITION_RECOVERIES
-                {
-                    retry_same_position = true;
-                    same_position_recoveries += 1;
-                    continue;
-                }
-            }
-        }
-
-        if let Some(overlap) = overlap {
-            retry_same_position = false;
-            same_position_recoveries = 0;
+        if let Some(overlap) = detect_vertical_overlap(previous, &next) {
             overlaps.push(overlap);
             measured_overlaps.push(overlap);
             frames.push(next);
         } else {
-            retry_same_position = false;
-            same_position_recoveries = 0;
 
             if let Some(overlap) = estimate_overlap_from_history(&measured_overlaps, next.height()) {
                 eprintln!(
@@ -233,11 +193,10 @@ fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SAME_POSITION_RECOVERIES, MAX_STAGNANT_SCROLLS};
+    use super::MAX_STAGNANT_SCROLLS;
 
     #[test]
-    fn stop_thresholds_allow_short_retries() {
+    fn stop_threshold_prevents_immediate_break() {
         assert!(MAX_STAGNANT_SCROLLS > 1);
-        assert!(MAX_SAME_POSITION_RECOVERIES > 1);
     }
 }
