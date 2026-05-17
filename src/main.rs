@@ -150,14 +150,20 @@ fn run() -> AppResult<()> {
         }
     }
 
-    let avg = overlaps.iter().copied().sum::<u32>() as f64 / overlaps.len() as f64;
-    let recent: Vec<u32> = overlaps.iter().rev().take(10).copied().rev().collect();
-    eprintln!(
-        "info: {} frames, last 10: {:?}, avg {:.1} px",
-        overlaps.len(),
-        recent,
-        avg
-    );
+    let estimate_count = overlaps.len() - measured_overlaps.len();
+    if !measured_overlaps.is_empty() {
+        let recent: Vec<u32> = measured_overlaps.iter().rev().take(10).copied().rev().collect();
+        let avg = measured_overlaps.iter().copied().sum::<u32>() as f64 / measured_overlaps.len() as f64;
+        eprintln!(
+            "info: {} overlaps ({} estimated), last 10 measured: {:?}, avg {:.1} px",
+            overlaps.len(),
+            estimate_count,
+            recent,
+            avg
+        );
+    } else {
+        eprintln!("info: {} overlaps (all estimated)", overlaps.len());
+    }
 
     let stitched = stitch_vertical(&frames, &overlaps)?;
     stitched
