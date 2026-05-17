@@ -1,8 +1,10 @@
 use image::imageops::{self, crop_imm, replace};
-use image::{GrayImage, Luma, Pixel, RgbaImage};
+use image::{GrayImage, Luma, RgbaImage};
 use imageproc::contrast::otsu_level;
 use imageproc::gradients::sobel_gradients;
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template};
+
+use average::{Estimate, Mean, Variance};
 
 use crate::error::{AppError, AppResult};
 
@@ -18,7 +20,7 @@ const GLOBAL_CONFIDENCE_DELTA: f32 = 0.005;
 const ALTERNATIVE_GAP: u32 = 4;
 const OVERLAP_VOTE_TOLERANCE: u32 = 5;
 const MIN_VOTE_WINDOW_WIDTH: u32 = 48;
-const VOTE_WINDOW_RATIO: f32 = 0.6;
+
 const TEXT_PAGE_MIN_BRIGHT_RATIO: f32 = 0.7;
 const TEXT_PAGE_MAX_INK_RATIO: f32 = 0.22;
 const TEXT_PAGE_MIN_ROW_VARIATION: f32 = 0.015;
@@ -27,6 +29,9 @@ const TEXT_BODY_ACTIVE_RATIO: f32 = 0.35;
 const TEXT_BODY_MIN_DENSITY: f32 = 0.012;
 const TEXT_BODY_MIN_WIDTH_RATIO: f32 = 0.18;
 const TEXT_BODY_PADDING_RATIO: f32 = 0.03;
+const SCROLLBAR_MARGIN_RATIO: f32 = 0.012;
+const SCROLLBAR_MARGIN_MAX: u32 = 24;
+const SSE_VALIDATE_THRESHOLD: f32 = 0.82;
 
 #[derive(Clone, Copy, Debug)]
 struct MatchCandidate {
@@ -91,7 +96,23 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         return None;
     }
 
-    let focus_band = shared_text_body_band(previous, current);
+    let scrollbar_margin = ((previous.width() as f32 * SCROLLBAR_MARGIN_RATIO) as u32)
+        .min(SCROLLBAR_MARGIN_MAX);
+    let scrollbar_safe_right = previous.width().saturating_sub(scrollbar_margin);
+    let default_band = (scrollbar_safe_right > 0).then(|| HorizontalBand {
+        left: 0,
+        right: scrollbar_safe_right,
+    });
+    let focus_band = shared_text_body_band(previous, current)
+        .map(|band| {
+            let right = band.right.min(scrollbar_safe_right);
+            HorizontalBand {
+                left: band.left,
+                right,
+            }
+        })
+        .filter(|band| band.left < band.right)
+        .or(default_band);
     let (previous_map, current_map) = overlap_match_maps(previous, current, focus_band);
 
     let texture_energy = estimate_texture_energy(&previous_map);
@@ -286,27 +307,22 @@ fn match_overlap_candidate_multiscale(
 
 fn candidate_vote_bands(width: u32) -> Vec<HorizontalBand> {
     let mut bands = Vec::new();
-    if width < MIN_VOTE_WINDOW_WIDTH.saturating_mul(2) {
+    if width < MIN_VOTE_WINDOW_WIDTH {
         return bands;
     }
 
-    let window_width = ((width as f32) * VOTE_WINDOW_RATIO).round() as u32;
-    let window_width = window_width.clamp(MIN_VOTE_WINDOW_WIDTH, width);
-    if window_width >= width {
-        return bands;
-    }
+    let band_count = 5u32.min(width / MIN_VOTE_WINDOW_WIDTH).max(2);
+    let base_band_width = width / band_count;
 
-    let start_positions = [0, (width - window_width) / 2, width - window_width];
-    for left in start_positions {
-        let band = HorizontalBand {
-            left,
-            right: left + window_width,
+    for i in 0..band_count {
+        let left = i * base_band_width;
+        let right = if i == band_count - 1 {
+            width
+        } else {
+            (i + 1) * base_band_width
         };
-        if !bands
-            .iter()
-            .any(|existing| existing.left == band.left && existing.right == band.right)
-        {
-            bands.push(band);
+        if right.saturating_sub(left) >= MIN_VOTE_WINDOW_WIDTH {
+            bands.push(HorizontalBand { left, right });
         }
     }
 
@@ -391,6 +407,7 @@ fn match_overlap_candidate(
 ) -> Option<MatchCandidate> {
     let previous = crop_gray_to_band(previous, band);
     let current = crop_gray_to_band(current, band);
+
     let template = crop_imm(
         &previous,
         0,
@@ -452,7 +469,7 @@ fn sse_validate(
     let sse_value = response.get_pixel(0, ncc_pos_in_search)[0].clamp(0.0, 1.0);
     let sse_similarity = 1.0 - sse_value;
 
-    sse_similarity >= 0.70
+    sse_similarity >= SSE_VALIDATE_THRESHOLD
 }
 
 fn refine_template_match(
@@ -493,39 +510,20 @@ fn best_alternative_score(
         .unwrap_or(f32::NAN)
 }
 
-fn to_grayscale(image: &RgbaImage) -> GrayImage {
-    let mut gray = GrayImage::new(image.width(), image.height());
-    for (x, y, pixel) in image.enumerate_pixels() {
-        gray.put_pixel(x, y, pixel.to_luma());
-    }
-    gray
-}
-
 fn mean_and_stddev(values: &[f32]) -> (f32, f32) {
-    if values.is_empty() {
-        return (0.0, 0.0);
+    let mut stats = Variance::new();
+    for v in values.iter().copied() {
+        stats.add(v as f64);
     }
-    let n = values.len() as f32;
-    let mean = values.iter().copied().sum::<f32>() / n;
-    let variance = values
-        .iter()
-        .copied()
-        .map(|v| {
-            let d = v - mean;
-            d * d
-        })
-        .sum::<f32>()
-        / n;
-    (mean, variance.sqrt())
+    (stats.mean() as f32, stats.sample_variance().sqrt() as f32)
 }
 
 fn estimate_texture_energy(image: &GrayImage) -> f32 {
-    let total = image.width() as u64 * image.height() as u64;
-    if total == 0 {
-        return 0.0;
+    let mut m = Mean::new();
+    for p in image.pixels() {
+        m.add(p[0] as f64);
     }
-    let sum: u64 = image.pixels().map(|p| p[0] as u64).sum();
-    (sum as f64 / total as f64 / 255.0) as f32
+    (m.mean() as f32) / 255.0
 }
 
 fn overlap_match_maps(
@@ -539,12 +537,12 @@ fn overlap_match_maps(
     if previous_has_features && current_has_features {
         (previous_map, current_map)
     } else {
-        (to_grayscale(previous), to_grayscale(current))
+        (imageops::grayscale(previous), imageops::grayscale(current))
     }
 }
 
 fn to_feature_map(image: &RgbaImage, band: Option<HorizontalBand>) -> (GrayImage, bool) {
-    let grayscale = to_grayscale(image);
+    let grayscale = imageops::grayscale(image);
     let grayscale = crop_gray_to_band(&grayscale, band);
     let gradients = sobel_gradients(&grayscale);
     let pixels: Vec<u16> = gradients.pixels().map(|p| p[0]).collect();
@@ -683,8 +681,8 @@ fn shared_text_body_band(
     previous: &RgbaImage,
     current: &RgbaImage,
 ) -> Option<HorizontalBand> {
-    let previous_gray = to_grayscale(previous);
-    let current_gray = to_grayscale(current);
+    let previous_gray = imageops::grayscale(previous);
+    let current_gray = imageops::grayscale(current);
     let previous_band = detect_text_body_band(&previous_gray)?;
     let current_band = detect_text_body_band(&current_gray)?;
     let left = previous_band.left.max(current_band.left);
@@ -773,21 +771,12 @@ fn smooth_density(values: &[f32], radius: usize) -> Vec<f32> {
     if n == 0 {
         return Vec::new();
     }
-    let initial_right = radius.min(n - 1);
-    let mut running: f32 = values[..=initial_right].iter().sum();
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let left = i.saturating_sub(radius);
-        let right = (i + radius).min(n - 1);
-        out.push(running / (right - left + 1) as f32);
-        if i + 1 < n {
-            if i + radius + 1 < n {
-                running += values[i + radius + 1];
-            }
-            if i >= radius {
-                running -= values[i - radius];
-            }
-        }
+        let right = (i + radius + 1).min(n);
+        let slice = &values[left..right];
+        out.push(slice.iter().sum::<f32>() / slice.len() as f32);
     }
     out
 }
@@ -810,9 +799,11 @@ fn score_body_band(
 }
 
 fn pixel_difference(a: [u8; 4], b: [u8; 4]) -> f32 {
-    ((a[0] as f32 - b[0] as f32).abs()
-        + (a[1] as f32 - b[1] as f32).abs()
-        + (a[2] as f32 - b[2] as f32).abs())
+    a.iter()
+        .zip(b.iter())
+        .take(3)
+        .map(|(x, y)| (*x as f32 - *y as f32).abs())
+        .sum::<f32>()
         / 3.0
 }
 

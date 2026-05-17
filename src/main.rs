@@ -82,6 +82,7 @@ fn run() -> AppResult<()> {
         stagnant_scrolls = 0;
 
         if let Some(overlap) = detect_vertical_overlap(previous, &next) {
+            let overlap = smooth_overlap(overlap, &measured_overlaps);
             overlaps.push(overlap);
             measured_overlaps.push(overlap);
             frames.push(next);
@@ -173,6 +174,23 @@ fn validate_frame_dimensions(previous: &image::RgbaImage, next: &image::RgbaImag
     }
 
     Ok(())
+}
+
+fn smooth_overlap(current: u32, measured: &[u32]) -> u32 {
+    const SMOOTHING_WINDOW: usize = 3;
+    if measured.len() < SMOOTHING_WINDOW {
+        return current;
+    }
+    let recent = &measured[measured.len().saturating_sub(SMOOTHING_WINDOW - 1)..];
+    let mut sorted: Vec<u32> = recent.iter().copied().collect();
+    sorted.push(current);
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    if current.abs_diff(median) > 3 {
+        median
+    } else {
+        current
+    }
 }
 
 fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<u32> {

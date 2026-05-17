@@ -236,6 +236,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "average"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "04c5a79a6c36c527e1c31bc0effa93af02e7278b7369b83e0674255290b6c1b0"
+dependencies = [
+ "easy-cast",
+ "float-ord",
+ "num-traits",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -536,6 +547,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "easy-cast"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23f40539c229fc2e4674bdecdf24bfcc2cb83631ca911c78a035fa9f2381c32b"
+dependencies = [
+ "libm",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -635,6 +655,12 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
 ]
+
+[[package]]
+name = "float-ord"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ce81f49ae8a0482e4c55ea62ebbd7e5a686af544c00b9d090bba3ff9be97b3d"
 
 [[package]]
 name = "form_urlencoded"
@@ -1969,6 +1995,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "scrollshot"
 version = "0.1.0"
 dependencies = [
+ "average",
  "clap",
  "image",
  "imageproc",
