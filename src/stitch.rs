@@ -15,9 +15,9 @@ const MIN_OVERLAP_RATIO: f32 = 0.02;
 const MAX_OVERLAP_RATIO: f32 = 0.995;
 const MIN_TEMPLATE_HEIGHT: u32 = 12;
 const TEMPLATE_HEIGHT_FACTORS: [u32; 9] = [1, 2, 3, 5, 8, 13, 21, 34, 55];
-const MATCH_SCORE_THRESHOLD: f32 = 0.78;
-const LOCAL_CONFIDENCE_DELTA: f32 = 0.006;
-const GLOBAL_CONFIDENCE_DELTA: f32 = 0.003;
+const MATCH_SCORE_THRESHOLD: f32 = 0.75;
+const LOCAL_CONFIDENCE_DELTA: f32 = 0.005;
+const GLOBAL_CONFIDENCE_DELTA: f32 = 0.002;
 const ALTERNATIVE_GAP: u32 = 4;
 const OVERLAP_VOTE_TOLERANCE: u32 = 5;
 const MIN_VOTE_WINDOW_WIDTH: u32 = 48;
@@ -32,7 +32,7 @@ const TEXT_BODY_MIN_WIDTH_RATIO: f32 = 0.18;
 const TEXT_BODY_PADDING_RATIO: f32 = 0.03;
 const SCROLLBAR_MARGIN_RATIO: f32 = 0.012;
 const SCROLLBAR_MARGIN_MAX: u32 = 24;
-const SSE_VALIDATE_THRESHOLD: f32 = 0.70;
+const SSE_VALIDATE_THRESHOLD: f32 = 0.65;
 
 #[derive(Clone, Copy, Debug)]
 struct MatchCandidate {
@@ -245,7 +245,7 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         SAMPLE_STEP,
         focus_band_crop,
     );
-    if pixel_diff > 12.0 {
+    if pixel_diff > 15.0 {
         return None;
     }
 
