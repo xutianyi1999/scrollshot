@@ -89,8 +89,10 @@ fn detect_overlap_inner(
         return None;
     }
 
-    let previous_gray = imageops::grayscale(previous);
-    let current_gray = imageops::grayscale(current);
+    let (previous_gray, current_gray) = rayon::join(
+        || imageops::grayscale(previous),
+        || imageops::grayscale(current),
+    );
 
     let scrollbar_margin = ((previous.width() as f32 * SCROLLBAR_MARGIN_RATIO) as u32)
         .min(SCROLLBAR_MARGIN_MAX);
@@ -111,10 +113,10 @@ fn detect_overlap_inner(
         .or(default_band);
 
     let focus_band_crop = focus_band.and_then(|band| normalized_band(Some(band), previous.width()));
-    let (previous_map, previous_has_features) =
-        to_feature_map_from_gray(&previous_gray, focus_band_crop);
-    let (current_map, current_has_features) =
-        to_feature_map_from_gray(&current_gray, focus_band_crop);
+    let ((previous_map, previous_has_features), (current_map, current_has_features)) = rayon::join(
+        || to_feature_map_from_gray(&previous_gray, focus_band_crop),
+        || to_feature_map_from_gray(&current_gray, focus_band_crop),
+    );
 
     let (previous_map, current_map) =
         if previous_has_features && current_has_features {
