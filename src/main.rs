@@ -81,6 +81,17 @@ fn run() -> AppResult<()> {
             overlaps.push(overlap);
             measured_overlaps.push(smoothed);
             frames.push(next);
+
+            if measured_overlaps.len() >= 4 {
+                let count = measured_overlaps.len() - 1;
+                let recent: Vec<u32> = measured_overlaps[..count].iter().rev().take(5).copied().collect();
+                let avg = recent.iter().copied().sum::<u32>() as f64 / recent.len() as f64;
+                let deviation = (overlap as f64 - avg).abs() / avg.max(1.0);
+                if deviation > 0.01 {
+                    eprintln!("info: overlap {overlap}px deviates {:.1}% from recent pattern ({avg:.0}px); page bottom likely reached", deviation * 100.0);
+                    break;
+                }
+            }
         } else if let Some(overlap) = estimate_overlap_from_history(&measured_overlaps, next.height()) {
             eprintln!(
                 "info: continuing with estimated overlap {} from history ({} prior frames)",

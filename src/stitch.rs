@@ -71,7 +71,7 @@ pub fn frames_near_stagnant(prev: &RgbaImage, curr: &RgbaImage) -> bool {
     }
     sampled_difference(
         prev, curr, 0, 0, prev.height(), SAMPLE_STEP, None,
-    ) <= 3.0
+    ) <= 2.0
 }
 
 pub fn detect_vertical_overlap(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
