@@ -2,6 +2,8 @@
 
 > Capture vertical long screenshots on Windows — scroll, capture, stitch.
 
+[![Build](https://github.com/xutianyi1999/scrollshot/actions/workflows/release.yml/badge.svg)](https://github.com/xutianyi1999/scrollshot/actions/workflows/release.yml)
+
 [中文](./README.zh-CN.md)
 
 Scrollshot is a CLI tool that lets you capture a scrolling (long) screenshot on Windows. You select a region on screen, and Scrollshot automatically scrolls downward while capturing frames, then stitches them into a single tall PNG image.
@@ -44,7 +46,7 @@ scrollshot --output longshot.png
 |------|-------------|---------|
 | `--output <PATH>` | Output PNG path | `scrollshot.png` |
 | `--max-scrolls <N>` | Maximum scroll steps | `8000` |
-| `--settle-ms <MS>` | Settle delay after each scroll (ms) | `100` |
+| `--settle-ms <MS>` | Settle delay after each scroll (ms) | `200` |
 | `--wheel-notches <N>` | Notches per scroll step (1+) | `4` |
 
 ### Controls
@@ -55,17 +57,18 @@ scrollshot --output longshot.png
 
 ## Platform Support
 
-**Windows only.** Scrollshot relies on Win32 API for DPI awareness, GDI-based screen capture (fallback), mouse event simulation, and the selection overlay. It requires Windows 10 or later with DPI virtualization compatible.
+**Windows only.** Scrollshot relies on Win32 API for DPI awareness, GDI-based screen capture (fallback), mouse event simulation, and the selection overlay. Requires Windows 10 or later, Rust 1.85+ (edition 2024).
 
 ## How Overlap Detection Works
 
-Each captured frame is compared to the previous one to find the exact pixel row where content overlaps. The algorithm:
+Each captured frame is compared to the previous one to find the exact pixel row where content overlaps. The pipeline:
 
-1. Converts both frames to grayscale, then applies Sobel gradient filtering so matching focuses on edges (text boundaries, UI borders) rather than flat color fields.
-2. Detects the main text-body column to avoid sidebar/UI noise.
-3. Slides a template (bottom of previous frame) across the top of the current frame using normalized cross-correlation.
-4. Validates the best match with local/global confidence margins and multi-band voting.
-5. If overlap detection fails several times consecutively, the capture loop stops with a warning.
+1. **Graveyard & text body** — converts both frames to grayscale once (shared across stages), detects the main text-body column to exclude sidebar/UI noise and scrollbar margin.
+2. **Feature maps** — applies Sobel gradient filtering so matching focuses on edges (text boundaries, UI borders) rather than flat color fields.
+3. **Parallel template matching** — slides templates of 7 different heights from the bottom of the previous frame across the top of the current frame using normalized cross-correlation; all 7 heights run in parallel via rayon.
+4. **Multi-scale refinement** — re-matches at half resolution for a coarse estimate, then refines at full resolution in a narrow search window.
+5. **Validation** — verifies the best candidate with Sum-of-Squared-Errors; checks local/global confidence margins and multi-band voting (5 non-overlapping bands in parallel).
+6. **Temporal smoothing** — suppresses single-frame outlier overlaps via median filtering before stitching.
 
 ## License
 
