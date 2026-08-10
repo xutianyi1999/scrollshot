@@ -5,6 +5,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use crate::capture::{CaptureBackend, ScreenCapture};
+use crate::capture_progress::{CaptureDecision, CaptureProgress};
 use crate::cli::Cli;
 use crate::error::AppResult;
 use crate::region::select_capture_region;
@@ -44,7 +45,7 @@ fn capture_scrollshot() -> AppResult<()> {
 
     let mut frames = Vec::with_capacity(cli.max_scrolls.saturating_add(1));
     let mut overlaps = Vec::with_capacity(cli.max_scrolls);
-    let mut measured_overlaps = Vec::with_capacity(cli.max_scrolls);
+    let mut progress = CaptureProgress::default();
 
     let first = capture.capture()?;
     frames.push(first);
@@ -68,57 +69,50 @@ fn capture_scrollshot() -> AppResult<()> {
 
         validate_frame_dimensions(previous, &next)?;
 
-        if frames_near_stagnant(previous, &next) {
-            log::info!("reached page bottom");
-            break;
-        }
-
-        let recent_overlaps: Vec<u32> = measured_overlaps.iter().rev().take(5).copied().collect();
-        let avg_overlap = (!recent_overlaps.is_empty()).then(|| {
-            recent_overlaps.iter().copied().sum::<u32>() as f32 / recent_overlaps.len() as f32
-        });
-        if let Some(overlap) = detect_vertical_overlap(previous, &next, avg_overlap) {
-            let smoothed = smooth_overlap(overlap, &measured_overlaps);
-            overlaps.push(overlap);
-            measured_overlaps.push(smoothed);
-            frames.push(next);
-
-            if measured_overlaps.len() >= 4 {
-                let avg = recent_overlaps.iter().copied().sum::<u32>() as f64
-                    / recent_overlaps.len() as f64;
-                let deviation = (overlap as f64 - avg).abs() / avg.max(1.0);
-                if deviation > 0.01 {
-                    log::info!(
-                        "overlap {overlap}px deviates {:.1}% from recent pattern ({avg:.0}px); page bottom likely reached",
-                        deviation * 100.0
-                    );
-                    break;
-                }
-            }
+        let decision = if frames_near_stagnant(previous, &next) {
+            progress.record_stagnant()
         } else if let Some(overlap) =
-            estimate_overlap_from_history(&measured_overlaps, next.height())
+            detect_vertical_overlap(previous, &next, progress.expected_overlap())
         {
-            log::info!(
-                "continuing with estimated overlap {} from history ({} prior frames)",
-                overlap,
-                measured_overlaps.len()
-            );
-            overlaps.push(overlap);
-            frames.push(next);
-            continue;
-        } else if frames.len() == 1 {
-            return Err(crate::error::AppError::OverlapNotFound);
+            progress.record_measured_with_height(overlap, Some(next.height()))
         } else {
-            log::warn!(
-                "overlap detection became unreliable after {} frame(s); saving the captured portion",
-                frames.len()
-            );
-            log::info!("[break: unreliable]");
-            break;
+            progress.record_unmatched(next.height())
+        };
+
+        match decision {
+            CaptureDecision::AppendMeasured(overlap) => {
+                overlaps.push(overlap);
+                frames.push(next);
+            }
+            CaptureDecision::AppendEstimated(overlap) => {
+                log::warn!(
+                    "overlap detection missed; using bounded history estimate {}px",
+                    overlap
+                );
+                overlaps.push(overlap);
+                frames.push(next);
+            }
+            CaptureDecision::Retry => {
+                log::debug!("capture produced no progress evidence; retrying after another scroll");
+            }
+            CaptureDecision::ReachedBottom => {
+                log::info!("reached page bottom after two stagnant captures");
+                break;
+            }
+            CaptureDecision::StopUnreliable => {
+                if frames.len() == 1 {
+                    return Err(crate::error::AppError::OverlapNotFound);
+                }
+                log::warn!(
+                    "overlap detection remained unreliable for too many captures; saving the captured portion"
+                );
+                break;
+            }
         }
     }
 
-    let estimate_count = overlaps.len() - measured_overlaps.len();
+    let measured_overlaps = progress.measured_overlaps();
+    let estimate_count = overlaps.len().saturating_sub(measured_overlaps.len());
     if !measured_overlaps.is_empty() {
         let recent: Vec<u32> = measured_overlaps
             .iter()
@@ -191,58 +185,4 @@ fn validate_frame_dimensions(
     }
 
     Ok(())
-}
-
-fn smooth_overlap(current: u32, measured: &[u32]) -> u32 {
-    const SMOOTHING_WINDOW: usize = 3;
-    if measured.len() < SMOOTHING_WINDOW {
-        return current;
-    }
-    let recent = &measured[measured.len().saturating_sub(SMOOTHING_WINDOW - 1)..];
-    let mut sorted = recent.to_vec();
-    sorted.push(current);
-    sorted.sort_unstable();
-    let median = sorted[sorted.len() / 2];
-    if current.abs_diff(median) > 3 {
-        median
-    } else {
-        current
-    }
-}
-
-fn estimate_overlap_from_history(overlaps: &[u32], frame_height: u32) -> Option<u32> {
-    let recent: Vec<u32> = overlaps.iter().rev().take(10).copied().collect();
-    if recent.len() < 2 {
-        return None;
-    }
-    let mut sorted = recent;
-    sorted.sort_unstable();
-    let median = sorted[sorted.len() / 2];
-    let min_allowed = (frame_height as f32 * 0.01).max(4.0) as u32;
-    let max_allowed = frame_height.saturating_sub(2);
-    if min_allowed > max_allowed {
-        return None;
-    }
-    Some(median.clamp(min_allowed, max_allowed))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::smooth_overlap;
-
-    #[test]
-    fn smooth_overlap_passes_through_normal_values() {
-        assert_eq!(smooth_overlap(100, &[98, 99, 101]), 100);
-    }
-
-    #[test]
-    fn smooth_overlap_clamps_single_frame_outlier() {
-        assert_eq!(smooth_overlap(200, &[98, 99, 101]), 101);
-    }
-
-    #[test]
-    fn smooth_overlap_requires_no_history() {
-        assert_eq!(smooth_overlap(100, &[]), 100);
-        assert_eq!(smooth_overlap(100, &[90]), 100);
-    }
 }

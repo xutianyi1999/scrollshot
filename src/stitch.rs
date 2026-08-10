@@ -1,6 +1,6 @@
-use image::imageops::{self, crop_imm, replace};
+use image::imageops::{self, FilterType, crop_imm, replace};
 use image::{GrayImage, Luma, RgbaImage};
-use imageproc::contrast::{otsu_level, threshold, ThresholdType};
+use imageproc::contrast::{ThresholdType, otsu_level, threshold};
 use imageproc::gradients::sobel_gradients;
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template};
 
@@ -19,6 +19,14 @@ const LOCAL_CONFIDENCE_DELTA: f32 = 0.005;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.002;
 const ALTERNATIVE_GAP: u32 = 4;
 const HISTORY_BIAS_WEIGHT: f32 = 0.50;
+const PREDICTED_SEARCH_MIN_RADIUS: u32 = 24;
+const PREDICTED_SEARCH_RADIUS_RATIO: f32 = 0.15;
+const COARSE_SEARCH_MAX_HEIGHT: u32 = 180;
+const STATIC_EDGE_MAX_RATIO: f32 = 0.12;
+const STATIC_EDGE_MIN_ROWS: u32 = 4;
+const STATIC_EDGE_MAX_DIFFERENCE: f32 = 1.0;
+const STAGNANT_AXIS_MIN_RATIO: f32 = 0.85;
+const STAGNANT_AXIS_MAX_DIFFERENCE: f32 = 2.0;
 
 const TEXT_PAGE_MIN_BRIGHT_RATIO: f32 = 0.7;
 const TEXT_PAGE_MAX_INK_RATIO: f32 = 0.22;
@@ -39,11 +47,16 @@ struct MatchCandidate {
     template_height: u32,
 }
 
-
 #[derive(Clone, Copy, Debug)]
 struct HorizontalBand {
     left: u32,
     right: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StaticEdges {
+    top: u32,
+    bottom: u32,
 }
 
 impl HorizontalBand {
@@ -52,16 +65,26 @@ impl HorizontalBand {
     }
 }
 
-
 /// Check whether two consecutive frames are nearly identical (relaxed
 /// threshold) — used as a safety net for noisy stuck-at-bottom detection.
 pub fn frames_near_stagnant(prev: &RgbaImage, curr: &RgbaImage) -> bool {
     if prev.dimensions() != curr.dimensions() {
         return false;
     }
-    sampled_difference(
-        prev, curr, 0, 0, prev.height(), SAMPLE_STEP, None,
-    ) <= 2.0
+    let edges = detect_static_edges(&[prev, curr]);
+    let start_y = edges.top;
+    let height = prev
+        .height()
+        .saturating_sub(edges.top.saturating_add(edges.bottom));
+    if height == 0 {
+        return false;
+    }
+
+    // A small animated widget can change every row or column while the
+    // document itself remains stationary. Requiring one stable axis avoids
+    // treating that local animation as continued scrolling.
+    stable_row_ratio(prev, curr, start_y, height) >= STAGNANT_AXIS_MIN_RATIO
+        || stable_column_ratio(prev, curr, start_y, height) >= STAGNANT_AXIS_MIN_RATIO
 }
 
 pub fn detect_vertical_overlap(
@@ -69,7 +92,16 @@ pub fn detect_vertical_overlap(
     current: &RgbaImage,
     expected_overlap: Option<f32>,
 ) -> Option<u32> {
-    detect_overlap_inner(previous, current, expected_overlap)
+    if previous.dimensions() != current.dimensions() {
+        return None;
+    }
+    let edges = detect_static_edges(&[previous, current]);
+    if edges == StaticEdges::default() {
+        return detect_overlap_inner(previous, current, expected_overlap);
+    }
+    let previous = crop_static_edges(previous, edges);
+    let current = crop_static_edges(current, edges);
+    detect_overlap_inner(&previous, &current, expected_overlap)
 }
 
 fn detect_overlap_inner(
@@ -94,8 +126,8 @@ fn detect_overlap_inner(
         || imageops::grayscale(current),
     );
 
-    let scrollbar_margin = ((previous.width() as f32 * SCROLLBAR_MARGIN_RATIO) as u32)
-        .min(SCROLLBAR_MARGIN_MAX);
+    let scrollbar_margin =
+        ((previous.width() as f32 * SCROLLBAR_MARGIN_RATIO) as u32).min(SCROLLBAR_MARGIN_MAX);
     let scrollbar_safe_right = previous.width().saturating_sub(scrollbar_margin);
     let default_band = (scrollbar_safe_right > 0).then_some(HorizontalBand {
         left: 0,
@@ -118,29 +150,155 @@ fn detect_overlap_inner(
         || to_feature_map_from_gray(&current_gray, focus_band_crop),
     );
 
-    let (previous_map, current_map) =
-        if previous_has_features && current_has_features {
-            (previous_map, current_map)
-        } else {
-            (previous_gray.clone(), current_gray.clone())
-        };
+    let (previous_map, current_map) = if previous_has_features && current_has_features {
+        (previous_map, current_map)
+    } else {
+        (previous_gray.clone(), current_gray.clone())
+    };
 
     let template_heights = candidate_template_heights(min_overlap, max_overlap);
-    let search_region = crop_imm(&current_map, 0, 0, current_map.width(), max_overlap).to_image();
-    let mut primary_candidates: Vec<MatchCandidate> = template_heights
+    let predicted_overlap = expected_overlap.or_else(|| {
+        coarse_overlap_prediction(&previous_map, &current_map, min_overlap, max_overlap)
+    });
+    let mut primary_candidates = collect_match_candidates(
+        &previous_map,
+        &current_map,
+        &template_heights,
+        min_overlap,
+        max_overlap,
+        predicted_overlap,
+    );
+
+    if let Some(overlap) = select_overlap(
+        &mut primary_candidates,
+        previous,
+        current,
+        focus_band_crop,
+        expected_overlap,
+    ) {
+        return Some(overlap);
+    }
+
+    // History only narrows the first attempt. A stale scroll estimate must
+    // never prevent a full search from recovering the actual overlap.
+    if predicted_overlap.is_some() {
+        primary_candidates = collect_match_candidates(
+            &previous_map,
+            &current_map,
+            &template_heights,
+            min_overlap,
+            max_overlap,
+            None,
+        );
+        return select_overlap(
+            &mut primary_candidates,
+            previous,
+            current,
+            focus_band_crop,
+            None,
+        );
+    }
+
+    None
+}
+
+fn collect_match_candidates(
+    previous_map: &GrayImage,
+    current_map: &GrayImage,
+    template_heights: &[u32],
+    min_overlap: u32,
+    max_overlap: u32,
+    expected_overlap: Option<f32>,
+) -> Vec<MatchCandidate> {
+    template_heights
         .par_iter()
         .copied()
         .filter_map(|template_height| {
             match_overlap_candidate(
-                &previous_map,
-                &search_region,
+                previous_map,
+                current_map,
                 template_height,
                 min_overlap,
                 max_overlap,
+                expected_overlap,
             )
         })
-        .collect();
+        .collect()
+}
 
+fn coarse_overlap_prediction(
+    previous_map: &GrayImage,
+    current_map: &GrayImage,
+    min_overlap: u32,
+    max_overlap: u32,
+) -> Option<f32> {
+    let scale = previous_map.height().div_ceil(COARSE_SEARCH_MAX_HEIGHT);
+    if scale <= 1 {
+        return None;
+    }
+
+    let target_width = previous_map.width().div_ceil(scale).max(1);
+    let target_height = previous_map.height().div_ceil(scale).max(1);
+    let previous_small = imageops::resize(
+        previous_map,
+        target_width,
+        target_height,
+        FilterType::Nearest,
+    );
+    let current_small = imageops::resize(
+        current_map,
+        target_width,
+        target_height,
+        FilterType::Nearest,
+    );
+    let min_overlap = min_overlap.div_ceil(scale);
+    let max_overlap = max_overlap / scale;
+    if min_overlap > max_overlap {
+        return None;
+    }
+
+    let template_heights = candidate_template_heights(min_overlap, max_overlap);
+    let mut candidates = collect_match_candidates(
+        &previous_small,
+        &current_small,
+        &template_heights,
+        min_overlap,
+        max_overlap,
+        None,
+    );
+    let best = select_match_candidate(&mut candidates, None)?;
+    Some(best.overlap as f32 * previous_map.height() as f32 / target_height as f32)
+}
+
+fn select_overlap(
+    primary_candidates: &mut [MatchCandidate],
+    previous: &RgbaImage,
+    current: &RgbaImage,
+    focus_band: Option<HorizontalBand>,
+    expected_overlap: Option<f32>,
+) -> Option<u32> {
+    let best = select_match_candidate(primary_candidates, expected_overlap)?;
+
+    let pixel_diff = sampled_difference(
+        previous,
+        current,
+        previous.height() - best.overlap,
+        0,
+        best.overlap,
+        SAMPLE_STEP,
+        focus_band,
+    );
+    if pixel_diff > 15.0 {
+        return None;
+    }
+
+    Some(best.overlap)
+}
+
+fn select_match_candidate(
+    primary_candidates: &mut [MatchCandidate],
+    expected_overlap: Option<f32>,
+) -> Option<MatchCandidate> {
     primary_candidates.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
@@ -178,20 +336,7 @@ fn detect_overlap_inner(
         return None;
     }
 
-    let pixel_diff = sampled_difference(
-        previous,
-        current,
-        previous.height() - best.overlap,
-        0,
-        best.overlap,
-        SAMPLE_STEP,
-        focus_band_crop,
-    );
-    if pixel_diff > 15.0 {
-        return None;
-    }
-
-    Some(best.overlap)
+    Some(best)
 }
 
 fn combine_with_bias(score: f32, overlap: u32, expected: f32) -> f32 {
@@ -208,6 +353,15 @@ pub fn stitch_vertical(frames: &[RgbaImage], overlaps: &[u32]) -> AppResult<Rgba
         return Err(AppError::InvalidStitchState);
     }
 
+    let frame_refs: Vec<&RgbaImage> = frames.iter().collect();
+    let edges = detect_static_edges(&frame_refs);
+    let cropped_frames = (edges != StaticEdges::default()).then(|| {
+        frames
+            .iter()
+            .map(|frame| crop_static_edges(frame, edges))
+            .collect::<Vec<_>>()
+    });
+    let frames = cropped_frames.as_deref().unwrap_or(frames);
     let width = frames[0].width();
     let mut total_height = frames[0].height();
 
@@ -231,6 +385,162 @@ pub fn stitch_vertical(frames: &[RgbaImage], overlaps: &[u32]) -> AppResult<Rgba
     Ok(output)
 }
 
+fn detect_static_edges(frames: &[&RgbaImage]) -> StaticEdges {
+    if frames.len() < 2 {
+        return StaticEdges::default();
+    }
+
+    let min_height = frames.iter().map(|frame| frame.height()).min().unwrap_or(0);
+    let max_rows = ((min_height as f32 * STATIC_EDGE_MAX_RATIO).floor() as u32)
+        .max(STATIC_EDGE_MIN_ROWS)
+        .min(min_height / 2);
+
+    let top = count_static_edge_rows(frames, max_rows, false);
+    let bottom = count_static_edge_rows(frames, max_rows, true);
+    StaticEdges {
+        top: (top >= STATIC_EDGE_MIN_ROWS).then_some(top).unwrap_or(0),
+        bottom: (bottom >= STATIC_EDGE_MIN_ROWS)
+            .then_some(bottom)
+            .unwrap_or(0),
+    }
+}
+
+fn count_static_edge_rows(frames: &[&RgbaImage], max_rows: u32, from_bottom: bool) -> u32 {
+    let reference = frames[0];
+    let mut count = 0;
+    for offset in 0..max_rows {
+        let reference_y = if from_bottom {
+            reference.height() - 1 - offset
+        } else {
+            offset
+        };
+        let unchanged = frames.iter().skip(1).all(|frame| {
+            let y = if from_bottom {
+                frame.height() - 1 - offset
+            } else {
+                offset
+            };
+            sampled_row_difference(reference, frame, reference_y, y) <= STATIC_EDGE_MAX_DIFFERENCE
+        });
+        if !unchanged {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn sampled_row_difference(
+    previous: &RgbaImage,
+    current: &RgbaImage,
+    previous_y: u32,
+    current_y: u32,
+) -> f32 {
+    if previous.width() != current.width() {
+        return f32::MAX;
+    }
+
+    let mut total = 0f32;
+    let mut count = 0u32;
+    for x in (0..previous.width()).step_by(SAMPLE_STEP as usize) {
+        let a = previous.get_pixel(x, previous_y).0;
+        let b = current.get_pixel(x, current_y).0;
+        total += a
+            .iter()
+            .zip(b.iter())
+            .take(3)
+            .map(|(left, right)| (*left as f32 - *right as f32).abs())
+            .sum::<f32>()
+            / 3.0;
+        count += 1;
+    }
+
+    if count == 0 {
+        f32::MAX
+    } else {
+        total / count as f32
+    }
+}
+
+fn stable_row_ratio(previous: &RgbaImage, current: &RgbaImage, start_y: u32, height: u32) -> f32 {
+    let mut stable = 0u32;
+    let mut sampled = 0u32;
+    for y in (start_y..start_y + height).step_by(SAMPLE_STEP as usize) {
+        if sampled_row_difference(previous, current, y, y) <= STAGNANT_AXIS_MAX_DIFFERENCE {
+            stable += 1;
+        }
+        sampled += 1;
+    }
+    if sampled == 0 {
+        0.0
+    } else {
+        stable as f32 / sampled as f32
+    }
+}
+
+fn stable_column_ratio(
+    previous: &RgbaImage,
+    current: &RgbaImage,
+    start_y: u32,
+    height: u32,
+) -> f32 {
+    let mut stable = 0u32;
+    let mut sampled = 0u32;
+    for x in (0..previous.width()).step_by(SAMPLE_STEP as usize) {
+        if sampled_column_difference(previous, current, x, start_y, height)
+            <= STAGNANT_AXIS_MAX_DIFFERENCE
+        {
+            stable += 1;
+        }
+        sampled += 1;
+    }
+    if sampled == 0 {
+        0.0
+    } else {
+        stable as f32 / sampled as f32
+    }
+}
+
+fn sampled_column_difference(
+    previous: &RgbaImage,
+    current: &RgbaImage,
+    x: u32,
+    start_y: u32,
+    height: u32,
+) -> f32 {
+    let mut total = 0f32;
+    let mut count = 0u32;
+    for y in (start_y..start_y + height).step_by(SAMPLE_STEP as usize) {
+        let a = previous.get_pixel(x, y).0;
+        let b = current.get_pixel(x, y).0;
+        total += a
+            .iter()
+            .zip(b.iter())
+            .take(3)
+            .map(|(left, right)| (*left as f32 - *right as f32).abs())
+            .sum::<f32>()
+            / 3.0;
+        count += 1;
+    }
+    if count == 0 {
+        f32::MAX
+    } else {
+        total / count as f32
+    }
+}
+
+fn crop_static_edges(image: &RgbaImage, edges: StaticEdges) -> RgbaImage {
+    let height = image.height().saturating_sub(edges.top + edges.bottom);
+    crop_imm(
+        image,
+        0,
+        edges.top.min(image.height()),
+        image.width(),
+        height,
+    )
+    .to_image()
+}
+
 fn candidate_template_heights(min_overlap: u32, max_overlap: u32) -> Vec<u32> {
     let mut heights: Vec<u32> = TEMPLATE_HEIGHT_FACTORS
         .iter()
@@ -246,10 +556,11 @@ fn candidate_template_heights(min_overlap: u32, max_overlap: u32) -> Vec<u32> {
 }
 fn match_overlap_candidate(
     previous: &GrayImage,
-    search_region: &GrayImage,
+    current: &GrayImage,
     template_height: u32,
     min_overlap: u32,
     max_overlap: u32,
+    expected_overlap: Option<f32>,
 ) -> Option<MatchCandidate> {
     let template = crop_imm(
         previous,
@@ -260,8 +571,16 @@ fn match_overlap_candidate(
     )
     .to_image();
 
+    let (search_start_y, search_end_y) =
+        match_search_range(template_height, min_overlap, max_overlap, expected_overlap)?;
+    let search_height = search_end_y
+        .checked_sub(search_start_y)?
+        .checked_add(template_height)?;
+    let search_region =
+        crop_imm(current, 0, search_start_y, current.width(), search_height).to_image();
+
     let response = match_template(
-        search_region,
+        &search_region,
         &template,
         MatchTemplateMethod::CrossCorrelationNormalized,
     );
@@ -269,7 +588,7 @@ fn match_overlap_candidate(
     let best_y = extremes.max_value_location.1;
 
     let (refined_y, refined_score) = refine_template_match(&response, best_y);
-    let refined_overlap = refined_y.round() as u32 + template_height;
+    let refined_overlap = search_start_y + refined_y.round() as u32 + template_height;
     if !(min_overlap..=max_overlap).contains(&refined_overlap) {
         return None;
     }
@@ -282,6 +601,31 @@ fn match_overlap_candidate(
     })
 }
 
+fn match_search_range(
+    template_height: u32,
+    min_overlap: u32,
+    max_overlap: u32,
+    expected_overlap: Option<f32>,
+) -> Option<(u32, u32)> {
+    let min_y = min_overlap.saturating_sub(template_height);
+    let max_y = max_overlap.checked_sub(template_height)?;
+    if min_y > max_y {
+        return None;
+    }
+
+    let Some(expected_overlap) = expected_overlap else {
+        return Some((min_y, max_y));
+    };
+
+    let expected = expected_overlap.max(0.0).round() as u32;
+    let predicted_y = expected.saturating_sub(template_height).clamp(min_y, max_y);
+    let radius = ((expected as f32 * PREDICTED_SEARCH_RADIUS_RATIO).round() as u32)
+        .max(PREDICTED_SEARCH_MIN_RADIUS);
+    Some((
+        predicted_y.saturating_sub(radius).max(min_y),
+        predicted_y.saturating_add(radius).min(max_y),
+    ))
+}
 
 fn refine_template_match(
     response: &imageproc::definitions::Image<image::Luma<f32>>,
@@ -313,7 +657,10 @@ fn best_alternative_score(
         .unwrap_or(f32::NAN)
 }
 
-fn to_feature_map_from_gray(grayscale: &GrayImage, band: Option<HorizontalBand>) -> (GrayImage, bool) {
+fn to_feature_map_from_gray(
+    grayscale: &GrayImage,
+    band: Option<HorizontalBand>,
+) -> (GrayImage, bool) {
     let grayscale = crop_gray_to_band(grayscale, band);
     let gradients = sobel_gradients(&grayscale);
 
@@ -367,7 +714,8 @@ fn sampled_difference(
         for x in (band.left..band.right).step_by(step as usize) {
             let a = previous.get_pixel(x, py).0;
             let b = current.get_pixel(x, cy).0;
-            total += a.iter()
+            total += a
+                .iter()
                 .zip(b.iter())
                 .take(3)
                 .map(|(x, y)| (*x as f32 - *y as f32).abs())
@@ -538,7 +886,9 @@ fn score_body_band(
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_text_body_band, detect_vertical_overlap, frames_near_stagnant, stitch_vertical};
+    use super::{
+        detect_text_body_band, detect_vertical_overlap, frames_near_stagnant, stitch_vertical,
+    };
     use image::imageops::{self, crop_imm};
     use image::{Rgba, RgbaImage};
 
@@ -555,10 +905,7 @@ mod tests {
         let first = crop(&source, 0, 60);
         let second = crop(&source, 23, 60);
 
-        assert_eq!(
-            detect_vertical_overlap(&first, &second, None),
-            Some(37)
-        );
+        assert_eq!(detect_vertical_overlap(&first, &second, None), Some(37));
     }
 
     #[test]
@@ -567,10 +914,7 @@ mod tests {
         let second = crop(&source, 25, 60);
         let third = crop(&source, 40, 60);
 
-        assert_eq!(
-            detect_vertical_overlap(&second, &third, None),
-            Some(45)
-        );
+        assert_eq!(detect_vertical_overlap(&second, &third, None), Some(45));
     }
 
     #[test]
@@ -579,10 +923,7 @@ mod tests {
         let first = crop(&source, 0, 100);
         let second = crop(&source, 2, 100);
 
-        assert_eq!(
-            detect_vertical_overlap(&first, &second, None),
-            Some(98)
-        );
+        assert_eq!(detect_vertical_overlap(&first, &second, None), Some(98));
     }
 
     #[test]
@@ -590,10 +931,7 @@ mod tests {
         let first = RgbaImage::from_pixel(48, 120, Rgba([245, 245, 245, 255]));
         let second = RgbaImage::from_pixel(48, 120, Rgba([245, 245, 245, 255]));
 
-        assert_eq!(
-            detect_vertical_overlap(&first, &second, None),
-            None
-        );
+        assert_eq!(detect_vertical_overlap(&first, &second, None), None);
     }
 
     #[test]
@@ -617,10 +955,7 @@ mod tests {
         let first = crop(&source, 0, 90);
         let second = crop(&source, 18, 90);
 
-        assert_eq!(
-            detect_vertical_overlap(&first, &second, None),
-            Some(72)
-        );
+        assert_eq!(detect_vertical_overlap(&first, &second, None), Some(72));
     }
 
     #[test]
@@ -642,10 +977,7 @@ mod tests {
         let first = crop(&source, 0, 120);
         let second = crop(&source, 24, 120);
 
-        assert_eq!(
-            detect_vertical_overlap(&first, &second, None),
-            Some(96)
-        );
+        assert_eq!(detect_vertical_overlap(&first, &second, None), Some(96));
     }
 
     fn build_source(width: u32, height: u32) -> RgbaImage {
@@ -700,7 +1032,11 @@ mod tests {
 
         for y in 0..height {
             for x in 0..sidebar_end {
-                let shade = if ((y / 18) + (x / 6)) % 2 == 0 { 228 } else { 238 };
+                let shade = if ((y / 18) + (x / 6)) % 2 == 0 {
+                    228
+                } else {
+                    238
+                };
                 image.put_pixel(x, y, Rgba([shade, shade, shade, 255]));
             }
         }
@@ -749,7 +1085,11 @@ mod tests {
         let mut image = build_document_like_source(width, height);
         for y in 0..height {
             for x in right_start..width {
-                let v = if ((y / 4) + (x / 4)) % 2 == 0 { 200u8 } else { 180u8 };
+                let v = if ((y / 4) + (x / 4)) % 2 == 0 {
+                    200u8
+                } else {
+                    180u8
+                };
                 image.put_pixel(x, y, Rgba([v, v, v, 255]));
             }
         }

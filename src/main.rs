@@ -3,6 +3,8 @@ mod app;
 #[cfg(windows)]
 mod capture;
 #[cfg(windows)]
+mod capture_progress;
+#[cfg(windows)]
 mod cli;
 #[cfg(windows)]
 mod error;
