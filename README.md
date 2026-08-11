@@ -46,8 +46,8 @@ scrollshot --output longshot.png
 |------|-------------|---------|
 | `--output <PATH>` | Output PNG path | `scrollshot.png` |
 | `--max-scrolls <N>` | Maximum scroll steps | `8000` |
-| `--settle-ms <MS>` | Settle delay after each scroll (ms) | `500` |
-| `--wheel-notches <N>` | Notches per scroll step (1+) | `1` |
+| `--settle-ms <MS>` | Settle delay after each scroll (ms) | `350` |
+| `--wheel-notches <N>` | Notches per scroll step (1+) | `2` |
 
 ### Controls
 
@@ -67,7 +67,7 @@ Each captured frame is compared to the previous one to find the exact pixel row 
 2. **Feature maps** — Sobel gradient filtering is applied so matching focuses on edges (text boundaries, UI borders) rather than flat color fields. If the frame lacks texture, the raw grayscale image is used as a fallback.
 3. **Parallel template matching** — 5 template heights (derived from multiplicative factors `[1,2,3,5,8]` × min overlap) are extracted from the bottom of the previous frame and slid across the top of the current frame using normalized cross-correlation; all heights run in parallel via rayon.
 4. **Coarse-to-fine ranking** — a downscaled full-range match narrows the high-resolution search. Previous scroll distances never narrow or bias the search; if the fast match fails validation, the full range is retried.
-5. **Validation** — the best candidate must pass: a minimum correlation threshold (0.75), a local confidence margin (≥0.005 over the next-best alternative at the same y), a global margin (≥0.002 over any alternative more than 4 px away), and a sampled pixel-difference check (mean delta ≤ 15).
+5. **Validation** — the best candidate must pass: a minimum correlation threshold (0.75), a local confidence margin (≥0.005 over the next-best alternative at the same y), a global margin (≥0.002 over any alternative more than 4 px away), a whole-overlap Sobel feature difference check, and a sampled pixel-difference check (mean delta ≤ 15).
 6. **Safe retry** — if no candidate passes validation, the same position is given one extra settle-and-capture attempt before the frame is discarded; the tool never invents an overlap from history and commits it to the output.
 7. **Stagnation detection** — if two consecutive frames are nearly identical (mean pixel delta ≤ 2.0 under a 2×2 sample step), the page bottom is assumed reached and capture stops.
 

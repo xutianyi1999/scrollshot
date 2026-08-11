@@ -86,6 +86,33 @@ fn stitch_benchmarks(c: &mut Criterion) {
         })
     });
 
+    c.bench_function("headless_dense_text_pipeline_1280x520_x8", |b| {
+        b.iter(|| {
+            let overlaps: Vec<_> = variable_frames
+                .windows(2)
+                .map(|pair| {
+                    stitch::detect_vertical_overlap(black_box(&pair[0]), black_box(&pair[1]), None)
+                        .expect("generated frame sequence must match")
+                })
+                .collect();
+            let stitched =
+                stitch::stitch_vertical(black_box(&variable_frames), black_box(&overlaps))
+                    .expect("generated frame sequence must stitch");
+            black_box(stitched)
+        })
+    });
+
+    let no_overlap_current = support::crop(&large_source, 1000, 720);
+    c.bench_function("dense_text_no_overlap_rejection_1280x720", |b| {
+        b.iter(|| {
+            stitch::detect_vertical_overlap(
+                black_box(&large_previous),
+                black_box(&no_overlap_current),
+                None,
+            )
+        })
+    });
+
     let header_frames: Vec<_> = starts
         .iter()
         .map(|start| support::fixed_header_frame(&large_source, *start, 520, 48))

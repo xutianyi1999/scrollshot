@@ -21,6 +21,11 @@ const MATCH_SCORE_THRESHOLD: f32 = 0.75;
 const LOCAL_CONFIDENCE_DELTA: f32 = 0.005;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.002;
 const ALTERNATIVE_GAP: u32 = 4;
+const MAX_PIXEL_DIFFERENCE: f32 = 15.0;
+// Text occupies a small fraction of a white page, so raw RGB averages can
+// make a one-line misalignment look deceptively close. Compare the Sobel
+// feature maps across the whole proposed overlap before committing a seam.
+const MAX_FEATURE_DIFFERENCE: f32 = 0.25;
 const PREDICTED_SEARCH_MIN_RADIUS: u32 = 24;
 const PREDICTED_SEARCH_RADIUS_RATIO: f32 = 0.15;
 const COARSE_SEARCH_MAX_HEIGHT: u32 = 180;
@@ -152,7 +157,8 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         || to_feature_map_from_gray(&current_gray, focus_band_crop),
     );
 
-    let (previous_map, current_map) = if previous_has_features && current_has_features {
+    let has_feature_maps = previous_has_features && current_has_features;
+    let (previous_map, current_map) = if has_feature_maps {
         (previous_map, current_map)
     } else {
         (previous_gray.clone(), current_gray.clone())
@@ -173,9 +179,15 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         predicted_overlap,
     );
 
-    if let Some(overlap) =
-        select_overlap(&mut primary_candidates, previous, current, focus_band_crop)
-    {
+    if let Some(overlap) = select_overlap(
+        &mut primary_candidates,
+        previous,
+        current,
+        &previous_map,
+        &current_map,
+        has_feature_maps,
+        focus_band_crop,
+    ) {
         return Some(overlap);
     }
 
@@ -191,7 +203,15 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
             max_overlap,
             None,
         );
-        return select_overlap(&mut primary_candidates, previous, current, focus_band_crop);
+        return select_overlap(
+            &mut primary_candidates,
+            previous,
+            current,
+            &previous_map,
+            &current_map,
+            has_feature_maps,
+            focus_band_crop,
+        );
     }
 
     None
@@ -269,9 +289,25 @@ fn select_overlap(
     primary_candidates: &mut [MatchCandidate],
     previous: &RgbaImage,
     current: &RgbaImage,
+    previous_map: &GrayImage,
+    current_map: &GrayImage,
+    has_feature_maps: bool,
     focus_band: Option<HorizontalBand>,
 ) -> Option<u32> {
     let best = select_match_candidate(primary_candidates)?;
+
+    if has_feature_maps
+        && sampled_feature_difference(
+            previous_map,
+            current_map,
+            previous_map.height() - best.overlap,
+            0,
+            best.overlap,
+            SAMPLE_STEP,
+        ) > MAX_FEATURE_DIFFERENCE
+    {
+        return None;
+    }
 
     let pixel_diff = sampled_difference(
         previous,
@@ -282,11 +318,43 @@ fn select_overlap(
         SAMPLE_STEP,
         focus_band,
     );
-    if pixel_diff > 15.0 {
+    if pixel_diff > MAX_PIXEL_DIFFERENCE {
         return None;
     }
 
     Some(best.overlap)
+}
+
+fn sampled_feature_difference(
+    previous: &GrayImage,
+    current: &GrayImage,
+    previous_start_y: u32,
+    current_start_y: u32,
+    height: u32,
+    step: u32,
+) -> f32 {
+    if previous.dimensions() != current.dimensions() {
+        return f32::MAX;
+    }
+
+    let mut total_difference = 0f32;
+    let mut total_energy = 0f32;
+    for y in (0..height).step_by(step as usize) {
+        let previous_y = previous_start_y + y;
+        let current_y = current_start_y + y;
+        for x in (0..previous.width()).step_by(step as usize) {
+            let left = previous.get_pixel(x, previous_y)[0] as f32;
+            let right = current.get_pixel(x, current_y)[0] as f32;
+            total_difference += (left - right).abs();
+            total_energy += left.max(right);
+        }
+    }
+
+    if total_energy == 0.0 {
+        f32::MAX
+    } else {
+        total_difference / total_energy
+    }
 }
 
 fn select_match_candidate(primary_candidates: &mut [MatchCandidate]) -> Option<MatchCandidate> {
@@ -862,7 +930,8 @@ fn score_body_band(
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_text_body_band, detect_vertical_overlap, frames_near_stagnant, stitch_vertical,
+        detect_text_body_band, detect_vertical_overlap, frames_near_stagnant,
+        sampled_feature_difference, stitch_vertical, to_feature_map_from_gray,
     };
     use image::imageops::{self, crop_imm};
     use image::{Rgba, RgbaImage};
@@ -931,6 +1000,43 @@ mod tests {
         let second = crop(&source, 18, 90);
 
         assert_eq!(detect_vertical_overlap(&first, &second, None), Some(72));
+    }
+
+    #[test]
+    fn feature_validation_distinguishes_a_correct_overlap_from_one_line_misalignment() {
+        let source = build_document_like_source(120, 320);
+        let previous = crop(&source, 0, 160);
+        let current = crop(&source, 67, 160);
+        let (previous_features, previous_has_features) =
+            to_feature_map_from_gray(&imageops::grayscale(&previous), None);
+        let (current_features, current_has_features) =
+            to_feature_map_from_gray(&imageops::grayscale(&current), None);
+        assert!(previous_has_features && current_has_features);
+
+        let correct_overlap = 93;
+        let correct = sampled_feature_difference(
+            &previous_features,
+            &current_features,
+            previous.height() - correct_overlap,
+            0,
+            correct_overlap,
+            2,
+        );
+        let one_line_misaligned_overlap = correct_overlap + 14;
+        let misaligned = sampled_feature_difference(
+            &previous_features,
+            &current_features,
+            previous.height() - one_line_misaligned_overlap,
+            0,
+            one_line_misaligned_overlap,
+            2,
+        );
+
+        assert!(correct < 0.1, "correct feature difference: {correct}");
+        assert!(
+            misaligned > 0.25,
+            "one-line feature difference should fail validation: {misaligned}"
+        );
     }
 
     #[test]
