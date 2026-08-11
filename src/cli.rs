@@ -18,10 +18,10 @@ pub struct Cli {
     pub max_scrolls: usize,
 
     /// Delay after each downward wheel scroll, in milliseconds.
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = 500)]
     pub settle_ms: u64,
 
     /// Number of downward wheel notches to send per step.
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(i32).range(1..))]
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(i32).range(1..))]
     pub wheel_notches: i32,
 }

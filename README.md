@@ -46,8 +46,8 @@ scrollshot --output longshot.png
 |------|-------------|---------|
 | `--output <PATH>` | Output PNG path | `scrollshot.png` |
 | `--max-scrolls <N>` | Maximum scroll steps | `8000` |
-| `--settle-ms <MS>` | Settle delay after each scroll (ms) | `200` |
-| `--wheel-notches <N>` | Notches per scroll step (1+) | `4` |
+| `--settle-ms <MS>` | Settle delay after each scroll (ms) | `500` |
+| `--wheel-notches <N>` | Notches per scroll step (1+) | `1` |
 
 ### Controls
 
@@ -66,12 +66,10 @@ Each captured frame is compared to the previous one to find the exact pixel row 
 1. **Grayscale & text body** — both frames are converted to grayscale once (shared across all stages). The main text-body column is detected via Otsu thresholding and ink-density analysis to exclude sidebars, UI noise, and the scrollbar margin (rightmost ~1.2%, capped at 24 px).
 2. **Feature maps** — Sobel gradient filtering is applied so matching focuses on edges (text boundaries, UI borders) rather than flat color fields. If the frame lacks texture, the raw grayscale image is used as a fallback.
 3. **Parallel template matching** — 5 template heights (derived from multiplicative factors `[1,2,3,5,8]` × min overlap) are extracted from the bottom of the previous frame and slid across the top of the current frame using normalized cross-correlation; all heights run in parallel via rayon.
-4. **Multi-bias ranking** — candidates are scored by correlation. When an expected overlap from recent history is available, scores are biased toward the historical value (50 % weight on proximity).
+4. **Coarse-to-fine ranking** — a downscaled full-range match narrows the high-resolution search. Previous scroll distances never narrow or bias the search; if the fast match fails validation, the full range is retried.
 5. **Validation** — the best candidate must pass: a minimum correlation threshold (0.75), a local confidence margin (≥0.005 over the next-best alternative at the same y), a global margin (≥0.002 over any alternative more than 4 px away), and a sampled pixel-difference check (mean delta ≤ 15).
-6. **Sub-pixel refinement** — the peak y coordinate is refined via parabolic interpolation of its neighbors.
-7. **Temporal smoothing** — outlier overlaps (>3 px from the median of the last 3 frames) are replaced with the median before stitching.
-8. **Stagnation detection** — if two consecutive frames are nearly identical (mean pixel delta ≤ 2.0 under a 2×2 sample step), the page bottom is assumed reached and capture stops.
-9. **History-based estimation** — when overlap detection fails (e.g., during a page transition), the median of the last 10 measured overlaps is used as a fallback.
+6. **Safe retry** — if no candidate passes validation, the same position is given one extra settle-and-capture attempt before the frame is discarded; the tool never invents an overlap from history and commits it to the output.
+7. **Stagnation detection** — if two consecutive frames are nearly identical (mean pixel delta ≤ 2.0 under a 2×2 sample step), the page bottom is assumed reached and capture stops.
 
 ## License
 

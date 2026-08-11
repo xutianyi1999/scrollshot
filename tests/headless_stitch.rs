@@ -39,17 +39,14 @@ fn run_headless_capture(input: &[RgbaImage]) -> (Vec<RgbaImage>, Vec<u32>, Headl
         let previous = frames.last().unwrap();
         let decision = if frames_near_stagnant(previous, next) {
             progress.record_stagnant()
-        } else if let Some(overlap) =
-            detect_vertical_overlap(previous, next, progress.expected_overlap())
-        {
+        } else if let Some(overlap) = detect_vertical_overlap(previous, next, None) {
             progress.record_measured_with_height(overlap, Some(next.height()))
         } else {
-            progress.record_unmatched(next.height())
+            progress.record_unmatched()
         };
 
         match decision {
-            CaptureDecision::AppendMeasured(overlap)
-            | CaptureDecision::AppendEstimated(overlap) => {
+            CaptureDecision::AppendMeasured(overlap) => {
                 overlaps.push(overlap);
                 frames.push(next.clone());
             }
@@ -98,6 +95,18 @@ fn dense_text_1280x720_detects_real_scroll_offset() {
         detected.abs_diff(320) <= 1,
         "expected overlap 320, got {detected}"
     );
+}
+
+#[test]
+fn dense_text_detects_a_safe_low_overlap_after_a_large_scroll() {
+    let source = support::dense_text_source(640, 2200);
+    let frame_height = 520;
+    let previous = support::crop(&source, 100, frame_height);
+    let current = support::crop(&source, 570, frame_height);
+
+    let detected = detect_vertical_overlap(&previous, &current, None)
+        .expect("a 50px overlap should still be enough to safely match");
+    assert_eq!(detected, 50);
 }
 
 #[test]
@@ -216,6 +225,22 @@ fn dense_text_recovers_when_history_is_wrong() {
 }
 
 #[test]
+fn stale_history_hint_never_changes_a_verified_pairwise_match() {
+    let source = support::dense_text_source(640, 2200);
+    let frame_height = 520;
+    let previous = support::crop(&source, 420, frame_height);
+    let current = support::crop(&source, 715, frame_height);
+
+    let without_hint = detect_vertical_overlap(&previous, &current, None)
+        .expect("pairwise overlap should be detected");
+    let with_stale_hint = detect_vertical_overlap(&previous, &current, Some(480.0))
+        .expect("stale history must not limit the search or change the seam");
+
+    assert_eq!(without_hint, 225);
+    assert_eq!(with_stale_hint, without_hint);
+}
+
+#[test]
 fn dark_dense_text_detects_real_scroll_offsets() {
     let source = support::dark_text_source(480, 1800);
     let previous = support::crop(&source, 0, 480);
@@ -312,21 +337,29 @@ fn valid_scroll_variation_never_triggers_bottom_confirmation() {
 }
 
 #[test]
-fn unmatched_captures_use_history_only_with_a_hard_bound() {
+fn verified_variable_scrolls_are_preserved_without_temporal_rewriting() {
+    let mut progress = CaptureProgress::default();
+    for overlap in [220, 221, 219] {
+        progress.record_measured_with_height(overlap, None);
+    }
+
+    assert_eq!(
+        progress.record_measured_with_height(264, None),
+        CaptureDecision::AppendMeasured(264),
+        "a real change in scroll distance must not be replaced by history"
+    );
+    assert_eq!(progress.measured_overlaps(), &[220, 221, 219, 264]);
+}
+
+#[test]
+fn unmatched_captures_are_retried_without_inventing_an_overlap() {
     let mut progress = CaptureProgress::default();
     progress.record_measured_with_height(220, None);
     progress.record_measured_with_height(221, None);
 
-    for _ in 0..5 {
-        assert!(matches!(
-            progress.record_unmatched(480),
-            CaptureDecision::AppendEstimated(_)
-        ));
-    }
-    assert_eq!(
-        progress.record_unmatched(480),
-        CaptureDecision::StopUnreliable
-    );
+    assert_eq!(progress.record_unmatched(), CaptureDecision::Retry);
+    assert_eq!(progress.record_unmatched(), CaptureDecision::Retry);
+    assert_eq!(progress.record_unmatched(), CaptureDecision::StopUnreliable);
 }
 
 #[test]
@@ -370,23 +403,26 @@ fn static_sidebar_does_not_hide_real_scroll() {
 }
 
 #[test]
-fn headless_capture_flow_bounds_repeated_unmatched_frames() {
+fn headless_capture_discards_unmatched_frames_and_recovers_on_a_later_match() {
     let source = support::dense_text_source(320, 1600);
-    let mut input = vec![
+    let input = vec![
         support::crop(&source, 0, 420),
         support::crop(&source, 180, 420),
+        RgbaImage::from_pixel(320, 420, Rgba([30, 30, 30, 255])),
+        RgbaImage::from_pixel(320, 420, Rgba([70, 70, 70, 255])),
         support::crop(&source, 360, 420),
     ];
-    for shade in [30, 70, 110, 150, 190, 230] {
-        input.push(RgbaImage::from_pixel(
-            320,
-            420,
-            Rgba([shade, shade, shade, 255]),
-        ));
-    }
 
     let (frames, overlaps, end) = run_headless_capture(&input);
-    assert_eq!(end, HeadlessCaptureEnd::Unreliable);
-    assert_eq!(frames.len(), 8, "five bounded estimates should be appended");
-    assert_eq!(overlaps.len(), 7);
+    assert_eq!(end, HeadlessCaptureEnd::ExhaustedInput);
+    assert_eq!(
+        frames.len(),
+        3,
+        "unmatched frames must not enter the stitch"
+    );
+    assert_eq!(overlaps.len(), 2);
+    assert_eq!(
+        stitch_vertical(&frames, &overlaps).unwrap(),
+        support::crop(&source, 0, 780)
+    );
 }

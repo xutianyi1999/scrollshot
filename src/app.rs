@@ -18,6 +18,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
 
 const ESC_POLL_INTERVAL_MS: u64 = 25;
+const CAPTURE_ATTEMPTS_PER_SCROLL: usize = 2;
+const MIN_RETRY_SETTLE_MS: u64 = 100;
 
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -50,7 +52,7 @@ fn capture_scrollshot() -> AppResult<()> {
     let first = capture.capture()?;
     frames.push(first);
 
-    for _ in 0..cli.max_scrolls {
+    'capture: for _ in 0..cli.max_scrolls {
         if capture_cancelled_by_escape() {
             log::warn!("stopped early by Esc; saving the captured portion");
             break;
@@ -64,55 +66,69 @@ fn capture_scrollshot() -> AppResult<()> {
             log::warn!("stopped early by Esc; saving the captured portion");
             break;
         }
-        let next = capture.capture()?;
-        let previous = frames.last().expect("at least one frame exists");
+        let mut next = capture.capture()?;
+        for attempt in 0..CAPTURE_ATTEMPTS_PER_SCROLL {
+            let previous = frames.last().expect("at least one frame exists");
 
-        validate_frame_dimensions(previous, &next)?;
+            validate_frame_dimensions(previous, &next)?;
 
-        let decision = if frames_near_stagnant(previous, &next) {
-            progress.record_stagnant()
-        } else if let Some(overlap) =
-            detect_vertical_overlap(previous, &next, progress.expected_overlap())
-        {
-            progress.record_measured_with_height(overlap, Some(next.height()))
-        } else {
-            progress.record_unmatched(next.height())
-        };
-
-        match decision {
-            CaptureDecision::AppendMeasured(overlap) => {
-                overlaps.push(overlap);
-                frames.push(next);
-            }
-            CaptureDecision::AppendEstimated(overlap) => {
-                log::warn!(
-                    "overlap detection missed; using bounded history estimate {}px",
-                    overlap
+            let mut unmatched = false;
+            let decision = if frames_near_stagnant(previous, &next) {
+                progress.record_stagnant()
+            } else if let Some(overlap) = detect_vertical_overlap(previous, &next, None) {
+                progress.record_measured_with_height(overlap, Some(next.height()))
+            } else if attempt + 1 < CAPTURE_ATTEMPTS_PER_SCROLL {
+                let retry_settle_ms = (cli.settle_ms / 2).max(MIN_RETRY_SETTLE_MS);
+                log::debug!(
+                    "overlap detection missed; waiting {retry_settle_ms}ms before recapturing the same position"
                 );
-                overlaps.push(overlap);
-                frames.push(next);
-            }
-            CaptureDecision::Retry => {
-                log::debug!("capture produced no progress evidence; retrying after another scroll");
-            }
-            CaptureDecision::ReachedBottom => {
-                log::info!("reached page bottom after two stagnant captures");
-                break;
-            }
-            CaptureDecision::StopUnreliable => {
-                if frames.len() == 1 {
-                    return Err(crate::error::AppError::OverlapNotFound);
+                if wait_for_scroll_settle_or_escape(retry_settle_ms) {
+                    log::warn!("stopped early by Esc; saving the captured portion");
+                    break 'capture;
                 }
-                log::warn!(
-                    "overlap detection remained unreliable for too many captures; saving the captured portion"
-                );
-                break;
+                next = capture.capture()?;
+                continue;
+            } else {
+                unmatched = true;
+                progress.record_unmatched()
+            };
+
+            match decision {
+                CaptureDecision::AppendMeasured(overlap) => {
+                    overlaps.push(overlap);
+                    frames.push(next);
+                    break;
+                }
+                CaptureDecision::Retry if unmatched => {
+                    log::warn!(
+                        "overlap detection missed; discarding this frame and retrying instead of guessing a seam"
+                    );
+                    break;
+                }
+                CaptureDecision::Retry => {
+                    log::debug!(
+                        "capture produced no progress evidence; retrying after another scroll"
+                    );
+                    break;
+                }
+                CaptureDecision::ReachedBottom => {
+                    log::info!("reached page bottom after two stagnant captures");
+                    break 'capture;
+                }
+                CaptureDecision::StopUnreliable => {
+                    if frames.len() == 1 {
+                        return Err(crate::error::AppError::OverlapNotFound);
+                    }
+                    log::warn!(
+                        "overlap detection remained unreliable for too many captures; saving the captured portion"
+                    );
+                    break 'capture;
+                }
             }
         }
     }
 
     let measured_overlaps = progress.measured_overlaps();
-    let estimate_count = overlaps.len().saturating_sub(measured_overlaps.len());
     if !measured_overlaps.is_empty() {
         let recent: Vec<u32> = measured_overlaps
             .iter()
@@ -124,14 +140,13 @@ fn capture_scrollshot() -> AppResult<()> {
         let avg =
             measured_overlaps.iter().copied().sum::<u32>() as f64 / measured_overlaps.len() as f64;
         log::info!(
-            "{} overlaps ({} estimated), last 10 measured: {:?}, avg {:.1} px",
+            "{} measured overlaps, last 10: {:?}, avg {:.1} px",
             overlaps.len(),
-            estimate_count,
             recent,
             avg
         );
     } else {
-        log::info!("{} overlaps (all estimated)", overlaps.len());
+        log::info!("no reliable overlaps were captured");
     }
 
     let stitched = stitch_vertical(&frames, &overlaps)?;

@@ -10,7 +10,10 @@ use rayon::prelude::*;
 use crate::error::{AppError, AppResult};
 
 const SAMPLE_STEP: u32 = 2;
-const MIN_OVERLAP_RATIO: f32 = 0.02;
+// Very small overlaps admit accidental matches in repetitive page content.
+// Treat them as a failed capture instead; the caller will retry with a fresh,
+// slower scroll rather than committing a bad seam.
+const MIN_OVERLAP_RATIO: f32 = 0.05;
 const MAX_OVERLAP_RATIO: f32 = 0.995;
 const MIN_TEMPLATE_HEIGHT: u32 = 12;
 const TEMPLATE_HEIGHT_FACTORS: [u32; 5] = [1, 2, 3, 5, 8];
@@ -18,7 +21,6 @@ const MATCH_SCORE_THRESHOLD: f32 = 0.75;
 const LOCAL_CONFIDENCE_DELTA: f32 = 0.005;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.002;
 const ALTERNATIVE_GAP: u32 = 4;
-const HISTORY_BIAS_WEIGHT: f32 = 0.50;
 const PREDICTED_SEARCH_MIN_RADIUS: u32 = 24;
 const PREDICTED_SEARCH_RADIUS_RATIO: f32 = 0.15;
 const COARSE_SEARCH_MAX_HEIGHT: u32 = 180;
@@ -92,23 +94,23 @@ pub fn detect_vertical_overlap(
     current: &RgbaImage,
     expected_overlap: Option<f32>,
 ) -> Option<u32> {
+    // Retained for API compatibility. Scroll history used to bias this
+    // decision, but it can be stale after smooth or variable scrolling and
+    // must never affect a seam that will be committed to the output.
+    let _ = expected_overlap;
     if previous.dimensions() != current.dimensions() {
         return None;
     }
     let edges = detect_static_edges(&[previous, current]);
     if edges == StaticEdges::default() {
-        return detect_overlap_inner(previous, current, expected_overlap);
+        return detect_overlap_inner(previous, current);
     }
     let previous = crop_static_edges(previous, edges);
     let current = crop_static_edges(current, edges);
-    detect_overlap_inner(&previous, &current, expected_overlap)
+    detect_overlap_inner(&previous, &current)
 }
 
-fn detect_overlap_inner(
-    previous: &RgbaImage,
-    current: &RgbaImage,
-    expected_overlap: Option<f32>,
-) -> Option<u32> {
+fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32> {
     if previous.width() != current.width() || previous.height() != current.height() {
         return None;
     }
@@ -157,9 +159,11 @@ fn detect_overlap_inner(
     };
 
     let template_heights = candidate_template_heights(min_overlap, max_overlap);
-    let predicted_overlap = expected_overlap.or_else(|| {
-        coarse_overlap_prediction(&previous_map, &current_map, min_overlap, max_overlap)
-    });
+    // Derive the search window from the two images being matched, never from
+    // a previous wheel distance. This keeps the fast path responsive without
+    // allowing stale history to move a seam.
+    let predicted_overlap =
+        coarse_overlap_prediction(&previous_map, &current_map, min_overlap, max_overlap);
     let mut primary_candidates = collect_match_candidates(
         &previous_map,
         &current_map,
@@ -169,18 +173,15 @@ fn detect_overlap_inner(
         predicted_overlap,
     );
 
-    if let Some(overlap) = select_overlap(
-        &mut primary_candidates,
-        previous,
-        current,
-        focus_band_crop,
-        expected_overlap,
-    ) {
+    if let Some(overlap) =
+        select_overlap(&mut primary_candidates, previous, current, focus_band_crop)
+    {
         return Some(overlap);
     }
 
-    // History only narrows the first attempt. A stale scroll estimate must
-    // never prevent a full search from recovering the actual overlap.
+    // A coarse image can be ambiguous for a highly repetitive page. It is an
+    // optimization only: fall back to the complete range before declaring the
+    // frame unmatched.
     if predicted_overlap.is_some() {
         primary_candidates = collect_match_candidates(
             &previous_map,
@@ -190,13 +191,7 @@ fn detect_overlap_inner(
             max_overlap,
             None,
         );
-        return select_overlap(
-            &mut primary_candidates,
-            previous,
-            current,
-            focus_band_crop,
-            None,
-        );
+        return select_overlap(&mut primary_candidates, previous, current, focus_band_crop);
     }
 
     None
@@ -266,7 +261,7 @@ fn coarse_overlap_prediction(
         max_overlap,
         None,
     );
-    let best = select_match_candidate(&mut candidates, None)?;
+    let best = select_match_candidate(&mut candidates)?;
     Some(best.overlap as f32 * previous_map.height() as f32 / target_height as f32)
 }
 
@@ -275,9 +270,8 @@ fn select_overlap(
     previous: &RgbaImage,
     current: &RgbaImage,
     focus_band: Option<HorizontalBand>,
-    expected_overlap: Option<f32>,
 ) -> Option<u32> {
-    let best = select_match_candidate(primary_candidates, expected_overlap)?;
+    let best = select_match_candidate(primary_candidates)?;
 
     let pixel_diff = sampled_difference(
         previous,
@@ -295,25 +289,12 @@ fn select_overlap(
     Some(best.overlap)
 }
 
-fn select_match_candidate(
-    primary_candidates: &mut [MatchCandidate],
-    expected_overlap: Option<f32>,
-) -> Option<MatchCandidate> {
+fn select_match_candidate(primary_candidates: &mut [MatchCandidate]) -> Option<MatchCandidate> {
     primary_candidates.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
             .then_with(|| b.template_height.cmp(&a.template_height))
     });
-
-    if let Some(expected) = expected_overlap {
-        primary_candidates.sort_by(|a, b| {
-            let a_score = combine_with_bias(a.score, a.overlap, expected);
-            let b_score = combine_with_bias(b.score, b.overlap, expected);
-            b_score
-                .total_cmp(&a_score)
-                .then_with(|| b.template_height.cmp(&a.template_height))
-        });
-    }
 
     let best = *primary_candidates.first()?;
 
@@ -337,12 +318,6 @@ fn select_match_candidate(
     }
 
     Some(best)
-}
-
-fn combine_with_bias(score: f32, overlap: u32, expected: f32) -> f32 {
-    let distance = (overlap as f32 - expected).abs();
-    let proximity = (-distance / expected.max(1.0)).exp();
-    score * (1.0 - HISTORY_BIAS_WEIGHT) + proximity * HISTORY_BIAS_WEIGHT
 }
 
 pub fn stitch_vertical(frames: &[RgbaImage], overlaps: &[u32]) -> AppResult<RgbaImage> {
