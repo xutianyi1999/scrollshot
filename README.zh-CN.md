@@ -44,8 +44,8 @@ scrollshot --output longshot.png
 |------|------|--------|
 | `--output <PATH>` | 输出 PNG 路径 | `scrollshot.png` |
 | `--max-scrolls <N>` | 最大滚动步数 | `8000` |
-| `--settle-ms <MS>` | 每次滚动后的等待时间（毫秒） | `350` |
-| `--wheel-notches <N>` | 每次滚动的滚轮格数（≥1） | `2` |
+| `--settle-ms <MS>` | 每次滚动后的等待时间（毫秒） | `250` |
+| `--wheel-notches <N>` | 每次滚动的滚轮格数（≥1） | `3` |
 
 ### 快捷键
 

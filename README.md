@@ -46,8 +46,8 @@ scrollshot --output longshot.png
 |------|-------------|---------|
 | `--output <PATH>` | Output PNG path | `scrollshot.png` |
 | `--max-scrolls <N>` | Maximum scroll steps | `8000` |
-| `--settle-ms <MS>` | Settle delay after each scroll (ms) | `350` |
-| `--wheel-notches <N>` | Notches per scroll step (1+) | `2` |
+| `--settle-ms <MS>` | Settle delay after each scroll (ms) | `250` |
+| `--wheel-notches <N>` | Notches per scroll step (1+) | `3` |
 
 ### Controls
 

@@ -32,6 +32,9 @@ const COARSE_SEARCH_MAX_HEIGHT: u32 = 180;
 const STATIC_EDGE_MAX_RATIO: f32 = 0.12;
 const STATIC_EDGE_MIN_ROWS: u32 = 4;
 const STATIC_EDGE_MAX_DIFFERENCE: f32 = 1.0;
+const STATIC_EDGE_MIN_CONTRAST: f32 = 6.0;
+const STATIC_EDGE_MIN_DARK_RATIO: f32 = 0.01;
+const STATIC_EDGE_DARK_LUMA: f32 = 245.0;
 const STAGNANT_AXIS_MIN_RATIO: f32 = 0.85;
 const STAGNANT_AXIS_MAX_DIFFERENCE: f32 = 2.0;
 
@@ -441,11 +444,52 @@ fn detect_static_edges(frames: &[&RgbaImage]) -> StaticEdges {
     let top = count_static_edge_rows(frames, max_rows, false);
     let bottom = count_static_edge_rows(frames, max_rows, true);
     StaticEdges {
-        top: (top >= STATIC_EDGE_MIN_ROWS).then_some(top).unwrap_or(0),
-        bottom: (bottom >= STATIC_EDGE_MIN_ROWS)
+        top: (top >= STATIC_EDGE_MIN_ROWS && static_edge_has_content(frames, top, false))
+            .then_some(top)
+            .unwrap_or(0),
+        bottom: (bottom >= STATIC_EDGE_MIN_ROWS && static_edge_has_content(frames, bottom, true))
             .then_some(bottom)
             .unwrap_or(0),
     }
+}
+
+fn static_edge_has_content(frames: &[&RgbaImage], height: u32, from_bottom: bool) -> bool {
+    let reference = frames[0];
+    let mut total_luminance = 0f32;
+    let mut total_squared_luminance = 0f32;
+    let mut dark_pixels = 0u32;
+    let mut count = 0u32;
+
+    for offset_y in (0..height).step_by(SAMPLE_STEP as usize) {
+        let y = if from_bottom {
+            reference.height() - 1 - offset_y
+        } else {
+            offset_y
+        };
+        for x in (0..reference.width()).step_by(SAMPLE_STEP as usize) {
+            let pixel = reference.get_pixel(x, y).0;
+            let luminance = pixel[..3]
+                .iter()
+                .map(|channel| *channel as f32)
+                .sum::<f32>()
+                / 3.0;
+            total_luminance += luminance;
+            total_squared_luminance += luminance * luminance;
+            if luminance < STATIC_EDGE_DARK_LUMA {
+                dark_pixels += 1;
+            }
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return false;
+    }
+
+    let mean = total_luminance / count as f32;
+    let variance = (total_squared_luminance / count as f32 - mean * mean).max(0.0);
+    variance.sqrt() >= STATIC_EDGE_MIN_CONTRAST
+        || dark_pixels as f32 / count as f32 >= STATIC_EDGE_MIN_DARK_RATIO
 }
 
 fn count_static_edge_rows(frames: &[&RgbaImage], max_rows: u32, from_bottom: bool) -> u32 {
@@ -930,8 +974,9 @@ fn score_body_band(
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_text_body_band, detect_vertical_overlap, frames_near_stagnant,
-        sampled_feature_difference, stitch_vertical, to_feature_map_from_gray,
+        StaticEdges, detect_static_edges, detect_text_body_band, detect_vertical_overlap,
+        frames_near_stagnant, sampled_feature_difference, stitch_vertical,
+        to_feature_map_from_gray,
     };
     use image::imageops::{self, crop_imm};
     use image::{Rgba, RgbaImage};
@@ -1000,6 +1045,26 @@ mod tests {
         let second = crop(&source, 18, 90);
 
         assert_eq!(detect_vertical_overlap(&first, &second, None), Some(72));
+    }
+
+    #[test]
+    fn blank_page_margins_are_not_mistaken_for_static_edges() {
+        let mut source = build_source(64, 220);
+        for (start, end) in [(0, 12), (60, 72), (108, 120), (168, 180)] {
+            for y in start..end {
+                for x in 0..source.width() {
+                    source.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+                }
+            }
+        }
+
+        let first = crop(&source, 0, 120);
+        let second = crop(&source, 60, 120);
+        assert_eq!(
+            detect_static_edges(&[&first, &second]),
+            StaticEdges::default()
+        );
+        assert_eq!(detect_vertical_overlap(&first, &second, None), Some(60));
     }
 
     #[test]
