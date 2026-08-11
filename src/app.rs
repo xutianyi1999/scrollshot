@@ -58,11 +58,23 @@ fn capture_scrollshot() -> AppResult<()> {
             break;
         }
 
+        let recovering = progress.is_recovering();
+        let wheel_notches = if recovering { 1 } else { cli.wheel_notches };
+        let settle_ms = if recovering {
+            cli.settle_ms.saturating_mul(2)
+        } else {
+            cli.settle_ms
+        };
+        if recovering {
+            log::debug!(
+                "overlap recovery: scrolling 1 notch and waiting {settle_ms}ms before recapturing"
+            );
+        }
         scroller.scroll_down_once(
             (selection.scroll_point.x, selection.scroll_point.y),
-            cli.wheel_notches,
+            wheel_notches,
         )?;
-        if wait_for_scroll_settle_or_escape(cli.settle_ms) {
+        if wait_for_scroll_settle_or_escape(settle_ms) {
             log::warn!("stopped early by Esc; saving the captured portion");
             break;
         }
@@ -100,9 +112,16 @@ fn capture_scrollshot() -> AppResult<()> {
                     break;
                 }
                 CaptureDecision::Retry if unmatched => {
-                    log::warn!(
-                        "overlap detection missed; discarding this frame and retrying instead of guessing a seam"
-                    );
+                    let attempts = progress.recovery_attempts();
+                    if attempts == 1 {
+                        log::warn!(
+                            "overlap detection missed; entering cautious recovery instead of guessing a seam"
+                        );
+                    } else {
+                        log::debug!(
+                            "overlap detection missed; discarding frame during cautious recovery attempt {attempts}"
+                        );
+                    }
                     break;
                 }
                 CaptureDecision::Retry => {

@@ -1,7 +1,8 @@
 // Never invent an overlap for an unmatched frame: a single wrong estimate
-// permanently shifts every later seam. Keep retries bounded so a page that
-// cannot be matched still terminates predictably.
-const MAX_CONSECUTIVE_RETRIES: usize = 3;
+// permanently shifts every later seam. A full viewport typically retains
+// ample overlap across several wheel steps, so allow a dynamic page enough
+// time to settle and recover before stopping.
+const MAX_CONSECUTIVE_RETRIES: usize = 10;
 const BOTTOM_CONFIRMATIONS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +74,14 @@ impl CaptureProgress {
 
     pub(crate) fn measured_overlaps(&self) -> &[u32] {
         &self.measured_overlaps
+    }
+
+    pub(crate) fn is_recovering(&self) -> bool {
+        self.consecutive_unmatched > 0
+    }
+
+    pub(crate) fn recovery_attempts(&self) -> usize {
+        self.consecutive_unmatched
     }
 
     fn recent_median_overlap(&self) -> Option<u32> {

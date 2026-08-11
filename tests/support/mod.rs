@@ -60,6 +60,114 @@ pub fn dense_text_source(width: u32, height: u32) -> RgbaImage {
     image
 }
 
+pub fn dense_text_with_table_source(
+    width: u32,
+    height: u32,
+    table_top: u32,
+    table_height: u32,
+) -> RgbaImage {
+    let mut image = dense_text_source(width, height);
+    draw_table(&mut image, table_top, table_height);
+    image
+}
+
+pub fn rich_document_source(width: u32, height: u32) -> RgbaImage {
+    let mut image = dense_text_source(width, height);
+    let visual_left = (width / 10).max(12);
+    let visual_width = width.saturating_sub(visual_left.saturating_mul(2));
+    draw_visual_block(&mut image, visual_left, 660, visual_width, 560);
+    draw_table(&mut image, 1_580, 1_460);
+    image
+}
+
+fn draw_visual_block(image: &mut RgbaImage, left: u32, top: u32, width: u32, height: u32) {
+    let right = left.saturating_add(width).min(image.width());
+    let bottom = top.saturating_add(height).min(image.height());
+    for y in top..bottom {
+        for x in left..right {
+            let local_x = x.saturating_sub(left);
+            let local_y = y.saturating_sub(top);
+            let texture = local_x
+                .wrapping_mul(17)
+                .wrapping_add(local_y.wrapping_mul(29))
+                .wrapping_add(local_x.wrapping_mul(local_y) % 97);
+            image.put_pixel(
+                x,
+                y,
+                Rgba([
+                    46 + (texture % 130) as u8,
+                    54 + ((texture / 3) % 120) as u8,
+                    68 + ((texture / 7) % 110) as u8,
+                    255,
+                ]),
+            );
+        }
+    }
+
+    for y in (top..bottom).step_by(67) {
+        for x in left..right {
+            image.put_pixel(x, y, Rgba([230, 238, 246, 255]));
+        }
+    }
+}
+
+fn draw_table(image: &mut RgbaImage, table_top: u32, table_height: u32) {
+    let width = image.width();
+    let height = image.height();
+    let table_bottom = table_top.saturating_add(table_height).min(height);
+    let left = (width / 32).max(8);
+    let right = width.saturating_sub(left);
+    let columns = [left, width / 2, right];
+    let header_height = 56;
+    let row_height = 72;
+
+    for y in table_top..table_bottom {
+        for x in left..right {
+            let color = if y < table_top.saturating_add(header_height) {
+                Rgba([232, 238, 248, 255])
+            } else {
+                Rgba([252, 252, 252, 255])
+            };
+            image.put_pixel(x, y, color);
+        }
+    }
+
+    for x in columns {
+        for y in table_top..table_bottom {
+            image.put_pixel(x, y, Rgba([204, 212, 226, 255]));
+        }
+    }
+    for y in (table_top..table_bottom).step_by(row_height as usize) {
+        for x in left..right {
+            image.put_pixel(x, y, Rgba([204, 212, 226, 255]));
+        }
+    }
+    if table_bottom > table_top {
+        for x in left..right {
+            image.put_pixel(x, table_bottom - 1, Rgba([204, 212, 226, 255]));
+        }
+    }
+
+    for (row_index, row_top) in (table_top..table_bottom)
+        .step_by(row_height as usize)
+        .enumerate()
+    {
+        let text_top = row_top.saturating_add(18);
+        for (column_index, pair) in columns.windows(2).enumerate() {
+            let text_left = pair[0].saturating_add(18);
+            let text_right = pair[1].saturating_sub(18);
+            let seed = (row_index as u32).wrapping_mul(31) ^ (column_index as u32 * 17);
+            for y in text_top..(text_top + 20).min(table_bottom) {
+                for x in text_left..text_right {
+                    if (x + y + seed) % 7 < 4 && (x / 3 + seed) % 5 != 0 {
+                        image.put_pixel(x, y, Rgba([68, 76, 92, 255]));
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn crop(source: &RgbaImage, start_y: u32, height: u32) -> RgbaImage {
     image::imageops::crop_imm(source, 0, start_y, source.width(), height).to_image()
 }

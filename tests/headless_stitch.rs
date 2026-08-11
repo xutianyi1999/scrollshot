@@ -177,6 +177,97 @@ fn dense_text_stitch_reconstructs_variable_scroll_steps_pixel_for_pixel() {
 }
 
 #[test]
+fn dense_text_to_table_transition_reconstructs_pixel_for_pixel() {
+    let source = support::dense_text_with_table_source(640, 3000, 900, 1500);
+    let frame_height = 520;
+    let starts = [300, 540, 780, 1030, 1300, 1570, 1810, 2050];
+    let frames: Vec<RgbaImage> = starts
+        .iter()
+        .map(|start| support::crop(&source, *start, frame_height))
+        .collect();
+    let overlaps: Vec<u32> = frames
+        .windows(2)
+        .map(|pair| {
+            detect_vertical_overlap(&pair[0], &pair[1], None)
+                .expect("text-to-table transitions should have a stable overlap")
+        })
+        .collect();
+    let expected_overlaps: Vec<u32> = starts
+        .windows(2)
+        .map(|pair| frame_height - (pair[1] - pair[0]))
+        .collect();
+    assert_eq!(
+        overlaps, expected_overlaps,
+        "must retain the exact source offsets"
+    );
+
+    let stitched = stitch_vertical(&frames, &overlaps).unwrap();
+    let expected = support::crop(
+        &source,
+        starts[0],
+        starts.last().unwrap() + frame_height - starts[0],
+    );
+    assert_eq!(stitched.dimensions(), expected.dimensions());
+    assert!(
+        stitched
+            .pixels()
+            .zip(expected.pixels())
+            .all(|(a, b)| a == b),
+        "stitched output must reproduce the source pixels"
+    );
+}
+
+#[test]
+fn rich_document_with_visuals_and_table_reconstructs_pixel_for_pixel() {
+    let source = support::rich_document_source(640, 3900);
+    let frame_height = 520;
+    let starts = [
+        120, 360, 620, 880, 1140, 1400, 1660, 1910, 2170, 2440, 2700, 2960, 3220,
+    ];
+    let frames: Vec<RgbaImage> = starts
+        .iter()
+        .map(|start| support::crop(&source, *start, frame_height))
+        .collect();
+    let overlaps: Vec<u32> = frames
+        .windows(2)
+        .enumerate()
+        .map(|pair| {
+            let (index, frames) = pair;
+            detect_vertical_overlap(&frames[0], &frames[1], None).unwrap_or_else(|| {
+                panic!(
+                    "mixed visual, text, and tabular content should have a stable overlap at {index} ({:?} -> {:?})",
+                    starts[index],
+                    starts[index + 1]
+                )
+            })
+        })
+        .collect();
+    let expected_overlaps: Vec<u32> = starts
+        .windows(2)
+        .map(|pair| frame_height - (pair[1] - pair[0]))
+        .collect();
+    assert_eq!(
+        overlaps, expected_overlaps,
+        "mixed-content seams must retain the exact source offsets"
+    );
+
+    let stitched = stitch_vertical(&frames, &overlaps).unwrap();
+    let expected = support::crop(
+        &source,
+        starts[0],
+        starts.last().unwrap() + frame_height - starts[0],
+    );
+    assert_eq!(stitched.dimensions(), expected.dimensions());
+    assert!(
+        stitched
+            .pixels()
+            .zip(expected.pixels())
+            .all(|(a, b)| a == b),
+        "mixed-content output must reproduce the source pixels"
+    );
+}
+
+#[test]
 fn headless_capture_flow_keeps_variable_scrolls_and_stops_at_bottom() {
     let source = support::dense_text_source(640, 2400);
     let frame_height = 520;
@@ -357,9 +448,28 @@ fn unmatched_captures_are_retried_without_inventing_an_overlap() {
     progress.record_measured_with_height(220, None);
     progress.record_measured_with_height(221, None);
 
-    assert_eq!(progress.record_unmatched(), CaptureDecision::Retry);
-    assert_eq!(progress.record_unmatched(), CaptureDecision::Retry);
+    for _ in 0..9 {
+        assert_eq!(progress.record_unmatched(), CaptureDecision::Retry);
+    }
     assert_eq!(progress.record_unmatched(), CaptureDecision::StopUnreliable);
+}
+
+#[test]
+fn recovery_mode_clears_after_the_next_reliable_match() {
+    let mut progress = CaptureProgress::default();
+    assert!(!progress.is_recovering());
+    assert_eq!(progress.recovery_attempts(), 0);
+
+    assert_eq!(progress.record_unmatched(), CaptureDecision::Retry);
+    assert!(progress.is_recovering());
+    assert_eq!(progress.recovery_attempts(), 1);
+
+    assert_eq!(
+        progress.record_measured_with_height(220, None),
+        CaptureDecision::AppendMeasured(220)
+    );
+    assert!(!progress.is_recovering());
+    assert_eq!(progress.recovery_attempts(), 0);
 }
 
 #[test]
@@ -410,6 +520,9 @@ fn headless_capture_discards_unmatched_frames_and_recovers_on_a_later_match() {
         support::crop(&source, 180, 420),
         RgbaImage::from_pixel(320, 420, Rgba([30, 30, 30, 255])),
         RgbaImage::from_pixel(320, 420, Rgba([70, 70, 70, 255])),
+        RgbaImage::from_pixel(320, 420, Rgba([110, 110, 110, 255])),
+        RgbaImage::from_pixel(320, 420, Rgba([150, 150, 150, 255])),
+        RgbaImage::from_pixel(320, 420, Rgba([190, 190, 190, 255])),
         support::crop(&source, 360, 420),
     ];
 

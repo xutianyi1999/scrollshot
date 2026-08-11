@@ -22,6 +22,10 @@ const LOCAL_CONFIDENCE_DELTA: f32 = 0.005;
 const GLOBAL_CONFIDENCE_DELTA: f32 = 0.002;
 const ALTERNATIVE_GAP: u32 = 4;
 const MAX_PIXEL_DIFFERENCE: f32 = 15.0;
+// Use a shared Sobel scale for both frames. Per-frame adaptive normalization
+// makes identical pixels receive different feature values when one viewport
+// contains a photo or illustration and the next does not.
+const FEATURE_GRADIENT_NORMALIZER: f32 = 1024.0;
 // Text occupies a small fraction of a white page, so raw RGB averages can
 // make a one-line misalignment look deceptively close. Compare the Sobel
 // feature maps across the whole proposed overlap before committing a seam.
@@ -30,7 +34,10 @@ const PREDICTED_SEARCH_MIN_RADIUS: u32 = 24;
 const PREDICTED_SEARCH_RADIUS_RATIO: f32 = 0.15;
 const COARSE_SEARCH_MAX_HEIGHT: u32 = 180;
 const STATIC_EDGE_MAX_RATIO: f32 = 0.12;
-const STATIC_EDGE_MIN_ROWS: u32 = 4;
+// A few coincidentally blank or repetitive rows near a table/image edge are
+// not a fixed browser chrome. Requiring a meaningful run prevents pairwise
+// edge cropping from changing seam coordinates for ordinary document content.
+const STATIC_EDGE_MIN_ROWS: u32 = 16;
 const STATIC_EDGE_MAX_DIFFERENCE: f32 = 1.0;
 const STATIC_EDGE_MIN_CONTRAST: f32 = 6.0;
 const STATIC_EDGE_MIN_DARK_RATIO: f32 = 0.01;
@@ -57,7 +64,7 @@ struct MatchCandidate {
     template_height: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HorizontalBand {
     left: u32,
     right: u32,
@@ -167,6 +174,63 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         (previous_gray.clone(), current_gray.clone())
     };
 
+    if let Some(overlap) = detect_overlap_from_maps(
+        previous,
+        current,
+        &previous_map,
+        &current_map,
+        has_feature_maps,
+        min_overlap,
+        max_overlap,
+        focus_band_crop,
+    ) {
+        return Some(overlap);
+    }
+
+    // The narrow document band avoids unrelated UI during the common text
+    // case. If it cannot verify a seam, retry over the full content area so
+    // images, tables, code blocks, and other mixed layouts retain their own
+    // alignment evidence.
+    let full_band = default_band.and_then(|band| normalized_band(Some(band), previous.width()));
+    if full_band == focus_band_crop {
+        return None;
+    }
+    let ((previous_map, previous_has_features), (current_map, current_has_features)) = rayon::join(
+        || to_feature_map_from_gray(&previous_gray, full_band),
+        || to_feature_map_from_gray(&current_gray, full_band),
+    );
+    let has_feature_maps = previous_has_features && current_has_features;
+    let (previous_map, current_map) = if has_feature_maps {
+        (previous_map, current_map)
+    } else {
+        (
+            crop_gray_to_band(&previous_gray, full_band),
+            crop_gray_to_band(&current_gray, full_band),
+        )
+    };
+
+    detect_overlap_from_maps(
+        previous,
+        current,
+        &previous_map,
+        &current_map,
+        has_feature_maps,
+        min_overlap,
+        max_overlap,
+        full_band,
+    )
+}
+
+fn detect_overlap_from_maps(
+    previous: &RgbaImage,
+    current: &RgbaImage,
+    previous_map: &GrayImage,
+    current_map: &GrayImage,
+    has_feature_maps: bool,
+    min_overlap: u32,
+    max_overlap: u32,
+    focus_band: Option<HorizontalBand>,
+) -> Option<u32> {
     let template_heights = candidate_template_heights(min_overlap, max_overlap);
     // Derive the search window from the two images being matched, never from
     // a previous wheel distance. This keeps the fast path responsive without
@@ -174,8 +238,8 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
     let predicted_overlap =
         coarse_overlap_prediction(&previous_map, &current_map, min_overlap, max_overlap);
     let mut primary_candidates = collect_match_candidates(
-        &previous_map,
-        &current_map,
+        previous_map,
+        current_map,
         &template_heights,
         min_overlap,
         max_overlap,
@@ -186,10 +250,10 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
         &mut primary_candidates,
         previous,
         current,
-        &previous_map,
-        &current_map,
+        previous_map,
+        current_map,
         has_feature_maps,
-        focus_band_crop,
+        focus_band,
     ) {
         return Some(overlap);
     }
@@ -199,8 +263,8 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
     // frame unmatched.
     if predicted_overlap.is_some() {
         primary_candidates = collect_match_candidates(
-            &previous_map,
-            &current_map,
+            previous_map,
+            current_map,
             &template_heights,
             min_overlap,
             max_overlap,
@@ -210,10 +274,10 @@ fn detect_overlap_inner(previous: &RgbaImage, current: &RgbaImage) -> Option<u32
             &mut primary_candidates,
             previous,
             current,
-            &previous_map,
-            &current_map,
+            previous_map,
+            current_map,
             has_feature_maps,
-            focus_band_crop,
+            focus_band,
         );
     }
 
@@ -751,28 +815,21 @@ fn to_feature_map_from_gray(
     let grayscale = crop_gray_to_band(grayscale, band);
     let gradients = sobel_gradients(&grayscale);
 
-    let mut max_gradient = 0u16;
-    let mut stats = Variance::new();
+    let mut has_gradient = false;
     for p in gradients.pixels() {
         let v = p[0];
-        stats.add(v as f64);
-        if v > max_gradient {
-            max_gradient = v;
-        }
+        has_gradient |= v > 0;
     }
 
-    if max_gradient == 0 {
+    if !has_gradient {
         let blank = GrayImage::new(grayscale.width(), grayscale.height());
         return (blank, false);
     }
-    let mean = stats.mean() as f32;
-    let stddev = stats.sample_variance().sqrt() as f32;
-    let normalizer = (mean + 3.0 * stddev).max(1.0);
 
     (
         GrayImage::from_fn(gradients.width(), gradients.height(), |x, y| {
             let gradient = gradients.get_pixel(x, y)[0] as f32;
-            let scaled = (gradient / normalizer) * 255.0;
+            let scaled = (gradient / FEATURE_GRADIENT_NORMALIZER) * 255.0;
             Luma([scaled.round().clamp(0.0, 255.0) as u8])
         }),
         true,

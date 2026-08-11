@@ -102,6 +102,29 @@ fn stitch_benchmarks(c: &mut Criterion) {
         })
     });
 
+    let rich_source = support::rich_document_source(1280, 3900);
+    let rich_starts = [
+        120, 360, 620, 880, 1140, 1400, 1660, 1910, 2170, 2440, 2700, 2960,
+    ];
+    let rich_frames: Vec<_> = rich_starts
+        .iter()
+        .map(|start| support::crop(&rich_source, *start, 520))
+        .collect();
+    c.bench_function("headless_mixed_content_pipeline_1280x520_x12", |b| {
+        b.iter(|| {
+            let overlaps: Vec<_> = rich_frames
+                .windows(2)
+                .map(|pair| {
+                    stitch::detect_vertical_overlap(black_box(&pair[0]), black_box(&pair[1]), None)
+                        .expect("generated mixed-content sequence must match")
+                })
+                .collect();
+            let stitched = stitch::stitch_vertical(black_box(&rich_frames), black_box(&overlaps))
+                .expect("generated mixed-content sequence must stitch");
+            black_box(stitched)
+        })
+    });
+
     let no_overlap_current = support::crop(&large_source, 1000, 720);
     c.bench_function("dense_text_no_overlap_rejection_1280x720", |b| {
         b.iter(|| {
