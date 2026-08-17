@@ -168,6 +168,61 @@ fn draw_table(image: &mut RgbaImage, table_top: u32, table_height: u32) {
     }
 }
 
+pub fn sparse_table_source(width: u32, height: u32) -> RgbaImage {
+    let mut image = RgbaImage::from_pixel(width, height, Rgba([250, 250, 251, 255]));
+
+    // A mostly empty grid: full-height vertical column borders and widely
+    // spaced horizontal row borders, like a table of tall blank cells with a
+    // single narrow text column.
+    let border = Rgba([206, 210, 218, 255]);
+    for x_frac in [0.03, 0.22, 0.41, 0.60, 0.78] {
+        let x = (width as f32 * x_frac) as u32;
+        for y in 0..height {
+            image.put_pixel(x, y, border);
+        }
+    }
+    for y in (0..height).step_by(400) {
+        for x in 0..width {
+            image.put_pixel(x, y, border);
+        }
+    }
+
+    let text_left = (width as f32 * 0.84) as u32;
+    let text_right = width.saturating_sub(24);
+    for line in 0..(height / 16) {
+        let baseline = 6 + line * 16;
+        let mut x = text_left + ((line * 7) % 9);
+        let mut word = 0u32;
+        while x + 4 < text_right {
+            let seed = line.wrapping_mul(97) ^ word.wrapping_mul(31);
+            let word_width = 10 + seed % 22;
+            let gap = 3 + seed % 5;
+            let ink = 40 + (seed % 40) as u8;
+            let end = (x + word_width).min(text_right);
+            let mut glyph_x = x;
+
+            while glyph_x < end {
+                let glyph_seed = seed ^ glyph_x.wrapping_mul(7);
+                let glyph_width = 1 + glyph_seed % 3;
+                let glyph_end = (glyph_x + glyph_width).min(end);
+                let glyph_top = baseline + (glyph_seed % 2);
+                let glyph_bottom = (baseline + 7 + (glyph_seed % 2)).min(height);
+                for fill_x in glyph_x..glyph_end {
+                    for fill_y in glyph_top..glyph_bottom {
+                        image.put_pixel(fill_x, fill_y, Rgba([ink, ink, ink, 255]));
+                    }
+                }
+                glyph_x = glyph_end.saturating_add(1 + glyph_seed % 2);
+            }
+
+            x = end.saturating_add(gap);
+            word = word.wrapping_add(1);
+        }
+    }
+
+    image
+}
+
 pub fn crop(source: &RgbaImage, start_y: u32, height: u32) -> RgbaImage {
     image::imageops::crop_imm(source, 0, start_y, source.width(), height).to_image()
 }

@@ -21,7 +21,9 @@ mod capture_progress;
 
 use capture_progress::{CaptureDecision, CaptureProgress};
 use image::{Rgba, RgbaImage};
-use stitch::{detect_vertical_overlap, frames_near_stagnant, stitch_vertical};
+use stitch::{
+    detect_vertical_overlap, frames_near_stagnant, scroll_progress_evident, stitch_vertical,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 enum HeadlessCaptureEnd {
@@ -38,7 +40,12 @@ fn run_headless_capture(input: &[RgbaImage]) -> (Vec<RgbaImage>, Vec<u32>, Headl
     for next in &input[1..] {
         let previous = frames.last().unwrap();
         let decision = if frames_near_stagnant(previous, next) {
-            progress.record_stagnant()
+            match detect_vertical_overlap(previous, next, None) {
+                Some(overlap) if scroll_progress_evident(previous, next, overlap) => {
+                    progress.record_measured_with_height(overlap, Some(next.height()))
+                }
+                _ => progress.record_stagnant(),
+            }
         } else if let Some(overlap) = detect_vertical_overlap(previous, next, None) {
             progress.record_measured_with_height(overlap, Some(next.height()))
         } else {
@@ -502,6 +509,69 @@ fn full_width_animated_strip_at_bottom_is_stagnant() {
     let previous = support::crop(&source, 400, 480);
     let current = support::add_animated_strip(&previous, 0, 42, 65);
     assert!(frames_near_stagnant(&previous, &current));
+}
+
+#[test]
+fn sparse_table_scroll_trips_the_axis_heuristic_but_proves_progress() {
+    let source = support::sparse_table_source(640, 2400);
+    let frame_height = 520;
+    let previous = support::crop(&source, 0, frame_height);
+    let current = support::crop(&source, 96, frame_height);
+
+    assert!(
+        frames_near_stagnant(&previous, &current),
+        "blank table cells satisfy the stagnant-axis heuristic"
+    );
+    let overlap = detect_vertical_overlap(&previous, &current, None)
+        .expect("the text column must still yield a verified overlap");
+    assert!(
+        overlap.abs_diff(frame_height - 96) <= 1,
+        "expected overlap {}, got {overlap}",
+        frame_height - 96
+    );
+    assert!(scroll_progress_evident(&previous, &current, overlap));
+}
+
+#[test]
+fn sparse_table_capture_keeps_scrolling_and_stops_at_a_real_bottom() {
+    let source = support::sparse_table_source(640, 2400);
+    let frame_height = 520;
+    let starts = [0, 96, 192, 288, 384, 480, 576];
+    let mut input: Vec<RgbaImage> = starts
+        .iter()
+        .map(|start| support::crop(&source, *start, frame_height))
+        .collect();
+    let bottom = input.last().unwrap().clone();
+    input.push(bottom.clone());
+    input.push(bottom.clone());
+
+    let (frames, overlaps, end) = run_headless_capture(&input);
+    assert_eq!(end, HeadlessCaptureEnd::ReachedBottom);
+    assert_eq!(
+        frames.len(),
+        starts.len(),
+        "sparse scrolled frames must be appended, not read as stagnant"
+    );
+
+    let stitched = stitch_vertical(&frames, &overlaps).unwrap();
+    assert_eq!(
+        stitched,
+        support::crop(&source, 0, starts.last().unwrap() + frame_height)
+    );
+}
+
+#[test]
+fn identical_periodic_frames_do_not_prove_scroll_progress() {
+    let height = 240;
+    let mut frame = RgbaImage::new(64, height);
+    for y in 0..height {
+        let shade = [240, 228, 216, 204][(y % 16 / 4) as usize];
+        for x in 0..64 {
+            frame.put_pixel(x, y, Rgba([shade, shade, shade, 255]));
+        }
+    }
+
+    assert!(!scroll_progress_evident(&frame, &frame, height - 32));
 }
 
 #[test]

@@ -4,7 +4,7 @@ use imageproc::contrast::{ThresholdType, otsu_level, threshold};
 use imageproc::gradients::sobel_gradients;
 use imageproc::template_matching::{MatchTemplateMethod, find_extremes, match_template};
 
-use average::{Estimate, Variance};
+use average::Variance;
 use rayon::prelude::*;
 
 use crate::error::{AppError, AppResult};
@@ -44,6 +44,10 @@ const STATIC_EDGE_MIN_DARK_RATIO: f32 = 0.01;
 const STATIC_EDGE_DARK_LUMA: f32 = 245.0;
 const STAGNANT_AXIS_MIN_RATIO: f32 = 0.85;
 const STAGNANT_AXIS_MAX_DIFFERENCE: f32 = 2.0;
+// Scrolled sparse content (tall blank table cells) can satisfy the stagnant
+// axis heuristic even though the document moved. A shifted alignment that
+// beats the at-rest alignment by this margin proves real scroll progress.
+const SCROLL_PROGRESS_MIN_REST_DIFFERENCE: f32 = 4.0;
 
 const TEXT_PAGE_MIN_BRIGHT_RATIO: f32 = 0.7;
 const TEXT_PAGE_MAX_INK_RATIO: f32 = 0.22;
@@ -102,6 +106,34 @@ pub fn frames_near_stagnant(prev: &RgbaImage, curr: &RgbaImage) -> bool {
     // treating that local animation as continued scrolling.
     stable_row_ratio(prev, curr, start_y, height) >= STAGNANT_AXIS_MIN_RATIO
         || stable_column_ratio(prev, curr, start_y, height) >= STAGNANT_AXIS_MIN_RATIO
+}
+
+/// Check whether a verified overlap represents real scroll progress rather
+/// than a coincidental match on stationary frames. Sparse content such as
+/// tall blank table cells can trip the stagnant-axis heuristic while the
+/// document scrolls; identical frames at a real bottom (or perfectly
+/// periodic content) align equally well at rest, so the shifted alignment
+/// must beat the at-rest alignment by a meaningful margin.
+pub fn scroll_progress_evident(previous: &RgbaImage, current: &RgbaImage, overlap: u32) -> bool {
+    if previous.dimensions() != current.dimensions() || overlap >= previous.height() {
+        return false;
+    }
+
+    let shifted = sampled_difference(
+        previous,
+        current,
+        previous.height() - overlap,
+        0,
+        overlap,
+        SAMPLE_STEP,
+        None,
+    );
+    if shifted > MAX_PIXEL_DIFFERENCE {
+        return false;
+    }
+
+    let at_rest = sampled_difference(previous, current, 0, 0, current.height(), SAMPLE_STEP, None);
+    at_rest > SCROLL_PROGRESS_MIN_REST_DIFFERENCE
 }
 
 pub fn detect_vertical_overlap(

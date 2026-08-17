@@ -10,7 +10,9 @@ use crate::cli::Cli;
 use crate::error::AppResult;
 use crate::region::select_capture_region;
 use crate::scroll::ScrollController;
-use crate::stitch::{detect_vertical_overlap, frames_near_stagnant, stitch_vertical};
+use crate::stitch::{
+    detect_vertical_overlap, frames_near_stagnant, scroll_progress_evident, stitch_vertical,
+};
 
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
@@ -86,7 +88,15 @@ fn capture_scrollshot() -> AppResult<()> {
 
             let mut unmatched = false;
             let decision = if frames_near_stagnant(previous, &next) {
-                progress.record_stagnant()
+                // Sparse scrolled content (tall blank table cells) can satisfy
+                // the axis heuristic while the document still moves; yield to
+                // it only when a verified shifted match cannot prove progress.
+                match detect_vertical_overlap(previous, &next, None) {
+                    Some(overlap) if scroll_progress_evident(previous, &next, overlap) => {
+                        progress.record_measured_with_height(overlap, Some(next.height()))
+                    }
+                    _ => progress.record_stagnant(),
+                }
             } else if let Some(overlap) = detect_vertical_overlap(previous, &next, None) {
                 progress.record_measured_with_height(overlap, Some(next.height()))
             } else if attempt + 1 < CAPTURE_ATTEMPTS_PER_SCROLL {
